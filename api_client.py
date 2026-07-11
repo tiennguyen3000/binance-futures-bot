@@ -157,12 +157,25 @@ class BinanceFuturesClient:
         }
         return self._request("POST", "/fapi/v1/order", signed=True, params=params)
 
-    def place_stop_loss(self, symbol: str, side: str, quantity: float, stop_price: float, price: float = None) -> dict:
-        """Place a stop-loss order.
+    def place_stop_loss(self, symbol: str, side: str, quantity: float, stop_price: float) -> dict:
+        """Place a stop-loss order using Algo API (STOP_MARKET deprecated on testnet).
         
         For LONG: side=SELL, stop_price below entry
         For SHORT: side=BUY, stop_price above entry
+        Falls back to old STOP_MARKET if Algo API fails (e.g. on mainnet).
         """
+        params = {
+            "symbol": symbol,
+            "side": side,
+            "type": "STOP_LOSS",
+            "quantity": self._normalize_qty(symbol, quantity),
+            "stopPrice": self._normalize_price(symbol, stop_price),
+            "reduceOnly": True,
+        }
+        result = self._request("POST", "/fapi/v1/algo/order/new", signed=True, params=params)
+        if result and "clientAlgoId" in result:
+            return result
+        # Fallback to old endpoint
         params = {
             "symbol": symbol,
             "side": side,
@@ -172,16 +185,27 @@ class BinanceFuturesClient:
             "reduceOnly": True,
             "newOrderRespType": "RESULT",
         }
-        if price:
-            params["price"] = self._normalize_price(symbol, price)
         return self._request("POST", "/fapi/v1/order", signed=True, params=params)
 
     def place_take_profit(self, symbol: str, side: str, quantity: float, price: float) -> dict:
-        """Place a take-profit limit order.
+        """Place a take-profit order using Algo API.
         
         For LONG: side=SELL, price above entry
         For SHORT: side=BUY, price below entry
+        Falls back to old TAKE_PROFIT_MARKET if Algo API fails.
         """
+        params = {
+            "symbol": symbol,
+            "side": side,
+            "type": "TAKE_PROFIT",
+            "quantity": self._normalize_qty(symbol, quantity),
+            "stopPrice": self._normalize_price(symbol, price),
+            "reduceOnly": True,
+        }
+        result = self._request("POST", "/fapi/v1/algo/order/new", signed=True, params=params)
+        if result and "clientAlgoId" in result:
+            return result
+        # Fallback to old endpoint
         params = {
             "symbol": symbol,
             "side": side,

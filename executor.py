@@ -156,7 +156,12 @@ class OrderExecutor:
             logger.info(f"  TP2 target: {tp2_price:.2f} (trailing/adjust later)")
             
             sl_result = self.client.place_stop_loss(symbol, close_side, quantity, sl_price)
+            if not sl_result or "orderId" not in sl_result:
+                logger.warning(f"SL order not placed for {symbol} — position still open, will monitor via sync")
+            
             tp_result = self.client.place_take_profit(symbol, close_side, quantity, tp1_price)
+            if not tp_result or "orderId" not in tp_result:
+                logger.warning(f"TP order not placed for {symbol} — position still open, will monitor via sync")
 
             # 7. Create position record
             position = Position(
