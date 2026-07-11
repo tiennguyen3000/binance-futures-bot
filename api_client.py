@@ -140,13 +140,14 @@ class BinanceFuturesClient:
         params = {"symbol": symbol, "marginType": margin_type}
         return self._request("POST", "/fapi/v1/marginType", signed=True, params=params)
 
-    def place_market_order(self, symbol: str, side: str, quantity: float) -> dict:
+    def place_market_order(self, symbol: str, side: str, quantity: float, position_side: str = None) -> dict:
         """Place a market order.
         
         Args:
             symbol: Trading pair (e.g. 'BTCUSDT')
             side: 'BUY' or 'SELL'
             quantity: Contract quantity
+            position_side: 'LONG' or 'SHORT' (required for HEDGE mode accounts)
         """
         params = {
             "symbol": symbol,
@@ -155,9 +156,11 @@ class BinanceFuturesClient:
             "quantity": self._normalize_qty(symbol, quantity),
             "newOrderRespType": "RESULT",
         }
+        if position_side:
+            params["positionSide"] = position_side
         return self._request("POST", "/fapi/v1/order", signed=True, params=params)
 
-    def place_stop_loss(self, symbol: str, side: str, quantity: float, stop_price: float) -> dict:
+    def place_stop_loss(self, symbol: str, side: str, quantity: float, stop_price: float, position_side: str = None) -> dict:
         """Place a stop-loss order using Algo API (STOP_MARKET deprecated on testnet).
         
         For LONG: side=SELL, stop_price below entry
@@ -172,6 +175,8 @@ class BinanceFuturesClient:
             "stopPrice": self._normalize_price(symbol, stop_price),
             "reduceOnly": True,
         }
+        if position_side:
+            params["positionSide"] = position_side
         result = self._request("POST", "/fapi/v1/algo/order/new", signed=True, params=params)
         if result and "clientAlgoId" in result:
             return result
@@ -185,9 +190,11 @@ class BinanceFuturesClient:
             "reduceOnly": True,
             "newOrderRespType": "RESULT",
         }
+        if position_side:
+            params["positionSide"] = position_side
         return self._request("POST", "/fapi/v1/order", signed=True, params=params)
 
-    def place_take_profit(self, symbol: str, side: str, quantity: float, price: float) -> dict:
+    def place_take_profit(self, symbol: str, side: str, quantity: float, price: float, position_side: str = None) -> dict:
         """Place a take-profit order using Algo API.
         
         For LONG: side=SELL, price above entry
@@ -202,6 +209,8 @@ class BinanceFuturesClient:
             "stopPrice": self._normalize_price(symbol, price),
             "reduceOnly": True,
         }
+        if position_side:
+            params["positionSide"] = position_side
         result = self._request("POST", "/fapi/v1/algo/order/new", signed=True, params=params)
         if result and "clientAlgoId" in result:
             return result
@@ -215,6 +224,8 @@ class BinanceFuturesClient:
             "reduceOnly": True,
             "newOrderRespType": "RESULT",
         }
+        if position_side:
+            params["positionSide"] = position_side
         return self._request("POST", "/fapi/v1/order", signed=True, params=params)
 
     def cancel_all_orders(self, symbol: str) -> dict:

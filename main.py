@@ -425,7 +425,10 @@ def main():
     # Setup logging
     logger = setup_logging(verbose=args.verbose)
 
-    testnet = not args.live
+    # Auto-detect mode: ưu tiên saved_mode từ .bot_state/mode.json
+    # (đã được set bởi Telegram /live hoặc /testnet),
+    # --live CLI flag ghi đè nếu được truyền.
+    testnet = not (args.live or saved_mode == "LIVE")
 
     if args.test:
         quick_test_run(testnet=testnet)

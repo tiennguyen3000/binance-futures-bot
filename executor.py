@@ -143,7 +143,7 @@ class OrderExecutor:
 
             # 5. Place market entry order
             logger.info(f"Opening {side} {symbol}: qty={quantity:.4f} @ ~{price:.2f}")
-            entry_result = self.client.place_market_order(symbol, order_side, quantity)
+            entry_result = self.client.place_market_order(symbol, order_side, quantity, position_side=side)
             
             if not entry_result or "orderId" not in entry_result:
                 logger.error(f"Entry order failed for {symbol}: {entry_result}")
@@ -155,11 +155,11 @@ class OrderExecutor:
             logger.info(f"Placing SL@{sl_price:.2f} and TP@{tp1_price:.2f} for {symbol}")
             logger.info(f"  TP2 target: {tp2_price:.2f} (trailing/adjust later)")
             
-            sl_result = self.client.place_stop_loss(symbol, close_side, quantity, sl_price)
+            sl_result = self.client.place_stop_loss(symbol, close_side, quantity, sl_price, position_side=side)
             if not sl_result or "orderId" not in sl_result:
                 logger.warning(f"SL order not placed for {symbol} — position still open, will monitor via sync")
             
-            tp_result = self.client.place_take_profit(symbol, close_side, quantity, tp1_price)
+            tp_result = self.client.place_take_profit(symbol, close_side, quantity, tp1_price, position_side=side)
             if not tp_result or "orderId" not in tp_result:
                 logger.warning(f"TP order not placed for {symbol} — position still open, will monitor via sync")
 
@@ -223,7 +223,7 @@ class OrderExecutor:
             close_side = "SELL" if position.side == "LONG" else "BUY"
             logger.info(f"Closing {position.side} {symbol} (market {close_side})")
 
-            close_result = self.client.place_market_order(symbol, close_side, position.quantity)
+            close_result = self.client.place_market_order(symbol, close_side, position.quantity, position_side=position.side)
             
             if not close_result or "orderId" not in close_result:
                 logger.error(f"Close order failed for {symbol}: {close_result}")
