@@ -180,7 +180,7 @@ def _handle_command(text: str) -> Optional[str]:
             f"📦 Vị thế: {pos_count}/{config.max_positions}\n"
             f"💰 Ví: {config.balance_usdt:.2f} USDT\n"
             f"📈 PnL: {config.total_pnl:+.2f} USDT\n"
-            f"💸 Funding: <{config.max_funding_rate_pct}%\n"
+            f"💸 Funding: &lt;{config.max_funding_rate_pct}%\n"
             f"💵 Vốn: 100 USDT | Đòn bẩy: 10x\n"
             f"📈 SL: ATR×1.5 | TP1: ATR×2 | TP2: ATR×3\n"
             f"🤖 Bot: @tiennk_future_auto_trading_bot"
