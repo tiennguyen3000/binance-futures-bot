@@ -42,42 +42,32 @@ class OrderExecutor:
         logger.info(f"OrderExecutor initialized: capital={capital_usdt} USDT, "
                      f"risk={risk_per_trade*100:.1f}%, lev={leverage}x")
 
-    def calculate_position_size(self, symbol: str, entry_price: float, sl_price: float) -> float:
+    POSITION_SIZE_PCT: float = 0.10  # 10% tổng vốn mỗi lệnh (fixed, ko theo risk)
+
+    def calculate_position_size(self, symbol: str, entry_price: float, sl_price: float = None) -> float:
         """
-        Calculate contract quantity based on risk management:
+        Tính khối lượng dựa trên % cố định của tổng vốn (mặc định 10%).
         
-        Risk amount = capital * risk_per_trade
-        Price risk = |entry - sl|
-        Position value = risk_amount / (price_risk / entry) * leverage
-        Quantity = position_value / entry_price
+        position_value = capital * POSITION_SIZE_PCT * leverage
+        qty = position_value / entry_price
         
-        Với 10x: capital=100, risk=1.5%, SL cách entry $2
-        risk_amount = 100 * 0.015 = 1.5 USDT
-        price_risk = $2
-        position_value = (1.5 / (2/100)) * 10 = 1.5/0.02*10 = 750 USDT
-        qty = 750 / entry_price
+        Với capital=100, pct=10%, lev=10x:
+        position_value = 100 * 0.10 * 10 = 100 USDT
+        qty = 100 / entry_price
         """
-        risk_amount = self.capital_usdt * self.risk_per_trade
-        price_risk_pct = abs(entry_price - sl_price) / entry_price if entry_price > 0 else 0.01
-        
-        if price_risk_pct < 0.001:
-            price_risk_pct = 0.01  # fallback 1%
-            logger.warning(f"SL too close to entry for {symbol}, using 1% fallback")
-        
-        # Position notional value
-        position_value = (risk_amount / price_risk_pct) * self.leverage
-        # Cap theo balance: không vượt quá capital * leverage
-        max_position_value = self.capital_usdt * self.leverage
-        if position_value > max_position_value:
-            logger.debug(f"Capping position from {position_value:.2f} to {max_position_value:.2f} USDT (balance limit)")
-            position_value = max_position_value
+        position_value = self.capital_usdt * self.POSITION_SIZE_PCT * self.leverage
+        logger.debug(
+            f"Position size for {symbol}: "
+            f"capital={self.capital_usdt} * {self.POSITION_SIZE_PCT*100:.0f}% * {self.leverage}x "
+            f"= {position_value:.2f} USDT"
+        )
         raw_qty = position_value / entry_price
 
         # Normalize to exchange lot size
         qty = self.client._normalize_qty(symbol, raw_qty)
         
         logger.debug(
-            f"Position size for {symbol}: risk={risk_amount:.2f} USDT, "
+            f"Position size for {symbol}: "
             f"notional={position_value:.2f} USDT, qty={qty:.6f} @ {entry_price}"
         )
         
