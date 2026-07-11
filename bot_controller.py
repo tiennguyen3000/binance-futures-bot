@@ -9,16 +9,28 @@ Cho phép điều khiển bot qua Telegram commands:
   /status       — Xem trạng thái bot
   /help         — Danh sách lệnh
 """
-import logging
 import json
+import logging
 import os
 import threading
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Optional
+
 import requests
 
 logger = logging.getLogger(__name__)
+
+# ─── Lazy Telegram config (đọc sau load_dotenv) ────────────────
+# QUAN TRỌNG: Dùng function thay vì module-level constant.
+# bot_controller được import TRƯỚC khi load_dotenv() gọi ở main.py,
+# nên os.getenv() ở module level sẽ trả về "".
+
+def _bot_token() -> str:
+    return os.getenv("TELEGRAM_BOT_TOKEN", "")
+
+def _chat_id() -> str:
+    return os.getenv("TELEGRAM_CHAT_ID", "")
 
 # ─── State file ─────────────────────────────────────────────────
 
@@ -49,41 +61,36 @@ def load_saved_mode() -> str:
     except Exception as e:
         logger.warning(f"Failed to load saved mode: {e}")
     return "TESTNET"
-from dataclasses import dataclass, field
-from typing import Optional
-import requests
 
-logger = logging.getLogger(__name__)
 
-# ─── Telegram polling ───────────────────────────────────────────
-
-BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
-
+# ─── Shared state ───────────────────────────────────────────────
 
 @dataclass
 class BotConfig:
     """Trạng thái có thể thay đổi động của bot."""
     trading_enabled: bool = True
     top_n: int = 30
-    mode: str = "TESTNET"          # "TESTNET" or "LIVE"
-    restart_needed: bool = False   # Báo hiệu cần restart để đổi mode
+    mode: str = "TESTNET"
+    restart_needed: bool = False
+    positions: list = None
+    total_pnl: float = 0.0
+    balance_usdt: float = 0.0
 
 
-# Shared instance
 config = BotConfig()
-_last_update_id: int = 0
-_polling_active = False
 
+
+# ─── Send Telegram ──────────────────────────────────────────────
 
 def send_tg(text: str) -> bool:
-    """Gửi tin nhắn Telegram."""
-    if not BOT_TOKEN or not CHAT_ID:
+    """Gửi tin nhắn Telegram — lazy token."""
+    token, chat = _bot_token(), _chat_id()
+    if not token or not chat:
         return False
     try:
         resp = requests.post(
-            f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-            json={"chat_id": CHAT_ID, "text": text, "parse_mode": "HTML",
+            f"https://api.telegram.org/bot{token}/sendMessage",
+            json={"chat_id": chat, "text": text, "parse_mode": "HTML",
                   "disable_web_page_preview": True},
             timeout=8,
         )
@@ -93,24 +100,26 @@ def send_tg(text: str) -> bool:
         return False
 
 
+# ─── Command handler ────────────────────────────────────────────
+
 def _handle_command(text: str) -> Optional[str]:
     """Xử lý command, trả về reply text hoặc None."""
     cmd = text.strip().lower()
     parts = cmd.split()
 
-    if cmd == "/start" or cmd == "start":
+    if cmd in ("/start", "start"):
         if config.trading_enabled:
             return "✅ Bot đang BẬT giao dịch rồi."
         config.trading_enabled = True
         return "✅ Đã BẬT giao dịch. Bot sẽ vào lệnh khi có tín hiệu."
 
-    elif cmd in ("/stop", "stop"):
+    if cmd in ("/stop", "stop"):
         if not config.trading_enabled:
             return "⏸ Bot đang TẮT giao dịch rồi."
         config.trading_enabled = False
         return "⏸ Đã TẮT giao dịch. Bot sẽ quét nhưng KHÔNG vào lệnh."
 
-    elif cmd == "/testnet" or cmd == "testnet":
+    if cmd in ("/testnet", "testnet"):
         if config.mode == "TESTNET":
             return "✅ Đã ở chế độ TESTNET."
         config.mode = "TESTNET"
@@ -118,8 +127,7 @@ def _handle_command(text: str) -> Optional[str]:
         _save_mode("TESTNET")
         return "🔄 Chuyển sang TESTNET. Vui lòng RESTART bot để áp dụng."
 
-    elif cmd == "/live" or cmd == "live":
-        # Kiểm tra file .env.live có tồn tại không
+    if cmd in ("/live", "live"):
         live_env = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env.live")
         if not os.path.isfile(live_env):
             return ("⚠️ <b>Chưa có key Live!</b>\n"
@@ -133,30 +141,61 @@ def _handle_command(text: str) -> Optional[str]:
         _save_mode("LIVE")
         return "⚠️ Chuyển sang <b>LIVE</b>. Vui lòng RESTART bot để áp dụng."
 
-    elif cmd.startswith("/scan") or cmd.startswith("scan"):
+    if cmd.startswith("/scan") or cmd.startswith("scan"):
         try:
             n = int(parts[1]) if len(parts) > 1 else 30
-            n = max(5, min(100, n))  # clamp 5-100
-            config.top_n = n
-            return f"🔍 Đã đặt số coin quét = {n}. Áp dụng ngay cho chu kỳ sau."
+            config.top_n = max(5, min(100, n))
+            return f"🔍 Đã đặt số coin quét = {config.top_n}."
         except (IndexError, ValueError):
             return f"🔍 Số coin hiện tại: {config.top_n}. Dùng: /scan <số> (5-100)"
 
-    elif cmd in ("/status", "status", "/dashboard"):
+    if cmd in ("/status", "status", "/dashboard"):
         mode_emoji = "🧪" if config.mode == "TESTNET" else "🔥"
         trading_emoji = "🟢" if config.trading_enabled else "🔴"
-        restart_warn = "\n⚠️ Cần restart để đổi mode!" if config.restart_needed else ""
+        warn = "\n⚠️ Cần restart để đổi mode!" if config.restart_needed else ""
+        pos_count = len(config.positions) if config.positions else 0
         return (
-            f"📊 <b>BOT DASHBOARD</b>{restart_warn}\n"
+            f"📊 <b>BOT DASHBOARD</b>{warn}\n"
             f"{mode_emoji} Mode: {config.mode}\n"
             f"{trading_emoji} Giao dịch: {'BẬT' if config.trading_enabled else 'TẮT'}\n"
             f"🔍 Quét: top {config.top_n} coins\n"
+            f"📦 Vị thế: {pos_count}/1\n"
+            f"💰 Ví: {config.balance_usdt:.2f} USDT\n"
+            f"📈 PnL: {config.total_pnl:+.2f} USDT\n"
             f"💵 Vốn: 100 USDT | Đòn bẩy: 10x\n"
             f"📈 SL: ATR×1.5 | TP1: ATR×2 | TP2: ATR×3\n"
             f"🤖 Bot: @tiennk_future_auto_trading_bot"
         )
 
-    elif cmd in ("/help", "help", "/start"):
+    if cmd in ("/position", "position", "/positions"):
+        if not config.positions:
+            return "📭 <b>Không có vị thế nào</b> — bot đang quét tìm tín hiệu."
+        lines = ["📦 <b>VỊ THẾ ĐANG MỞ</b>"]
+        for p in config.positions:
+            emoji = "🟢" if p.get("side") == "LONG" else "🔴"
+            lines.append(
+                f"{emoji} {p['symbol']} {p['side']}\n"
+                f"  • Vào: {p['entry_price']:.2f}\n"
+                f"  • SL: {p['sl_price']:.2f} | TP: {p['tp_price']:.2f}\n"
+                f"  • PnL: {p.get('unrealized_pnl',0):+.2f} USDT ({p.get('roi_pct',0):+.2f}%)"
+            )
+        return "\n".join(lines)
+
+    if cmd in ("/pnl", "pnl", "/profit"):
+        if not config.positions:
+            return f"📊 <b>TỔNG KẾT</b>\n💰 Ví: {config.balance_usdt:.2f} USDT\n📈 PnL: {config.total_pnl:+.2f} USDT\n📭 Không có vị thế mở."
+        lines = ["📊 <b>TỔNG KẾT P&L</b>"]
+        total_pnl = 0.0
+        for p in config.positions:
+            pnl = p.get("unrealized_pnl", 0)
+            total_pnl += pnl
+            emoji = "📈" if pnl >= 0 else "📉"
+            lines.append(f"{emoji} {p['symbol']}: {pnl:+.2f} USDT ({p.get('roi_pct',0):+.2f}%)")
+        lines.append(f"\n💰 Ví: {config.balance_usdt:.2f} USDT")
+        lines.append(f"{'📈' if total_pnl>=0 else '📉'} <b>Tổng PnL: {total_pnl:+.2f} USDT</b>")
+        return "\n".join(lines)
+
+    if cmd in ("/help", "help"):
         return (
             "🤖 <b>HƯỚNG DẪN ĐIỀU KHIỂN BOT</b>\n\n"
             "/start — Bật giao dịch\n"
@@ -164,6 +203,8 @@ def _handle_command(text: str) -> Optional[str]:
             "/testnet — Chuyển testnet (cần restart)\n"
             "/live — Chuyển live (cần restart)\n"
             "/scan 50 — Đặt số coin quét\n"
+            "/position — Xem vị thế đang mở\n"
+            "/pnl — Tổng kết lãi lỗ\n"
             "/status — Dashboard tổng quan\n"
             "/help — Danh sách lệnh"
         )
@@ -171,44 +212,40 @@ def _handle_command(text: str) -> Optional[str]:
     return None
 
 
-def polling_loop(stop_event: threading.Event):
-    """
-    Chạy trong thread riêng, poll Telegram API để nhận commands.
-    """
-    global _last_update_id, _polling_active
+# ─── Polling thread ─────────────────────────────────────────────
 
-    if not BOT_TOKEN:
-        logger.info("Telegram polling disabled: no BOT_TOKEN")
+_last_update_id: int = 0
+
+
+def polling_loop(stop_event: threading.Event):
+    """Chạy trong thread riêng, poll Telegram API để nhận commands."""
+    global _last_update_id
+
+    token, chat = _bot_token(), _chat_id()
+    if not token or not chat:
+        logger.info("Telegram polling disabled: TELEGRAM_BOT_TOKEN/CHAT_ID not configured")
         return
 
-    _polling_active = True
     logger.info("Telegram command listener started (polling)")
-
     while not stop_event.is_set():
         try:
             resp = requests.get(
-                f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates",
-                params={
-                    "offset": _last_update_id + 1,
-                    "timeout": 30,  # long polling
-                    "allowed_updates": ["message"],
-                },
+                f"https://api.telegram.org/bot{token}/getUpdates",
+                params={"offset": _last_update_id + 1, "timeout": 30,
+                        "allowed_updates": ["message"]},
                 timeout=35,
             )
             if not resp.ok:
                 time.sleep(5)
                 continue
 
-            data = resp.json()
-            for update in data.get("result", []):
+            for update in resp.json().get("result", []):
                 _last_update_id = update.get("update_id", _last_update_id)
                 msg = update.get("message", {})
-                chat_id = str(msg.get("chat", {}).get("id", ""))
+                cid = str(msg.get("chat", {}).get("id", ""))
                 text = msg.get("text", "").strip()
 
-                # Chỉ xử lý từ chat được phép
-                if chat_id != CHAT_ID:
-                    logger.debug(f"Ignored message from {chat_id}")
+                if cid != chat:
                     continue
 
                 reply = _handle_command(text)
@@ -217,12 +254,11 @@ def polling_loop(stop_event: threading.Event):
                     logger.info(f"TG command '{text}' → replied")
 
         except requests.Timeout:
-            continue  # long polling timeout is normal
+            continue
         except Exception as e:
             logger.warning(f"TG polling error: {e}")
             time.sleep(5)
 
-    _polling_active = False
     logger.info("Telegram command listener stopped")
 
 
