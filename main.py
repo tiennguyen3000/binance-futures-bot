@@ -40,7 +40,7 @@ else:
 
 from api_client import BinanceFuturesClient
 from state_manager import StateManager, BotState, Position
-from scanner import SmartScanner as SignalScanner
+from scanner import SmartScanner as SignalScanner, klines_to_df, atr
 from executor import OrderExecutor
 from telegram_notifier import (
     send_message, signal_msg, entry_msg, exit_msg,
@@ -236,6 +236,7 @@ def sync_exchange_positions(client: BinanceFuturesClient, state_mgr: StateManage
     """
     Import ANY open position từ exchange vào StateManager.
     (Xử lý trường hợp restart bot khi còn position trên sàn)
+    Tính SL/TP dựa trên ATR nếu chưa có.
     """
     logger = logging.getLogger(__name__)
     try:
@@ -249,14 +250,34 @@ def sync_exchange_positions(client: BinanceFuturesClient, state_mgr: StateManage
                 continue
             side = "LONG" if amt > 0 else "SHORT"
             entry = float(p.get("entryPrice", 0))
-            logger.info(f"Synced position from exchange: {side} {symbol} {abs(amt)} @ {entry}")
+            
+            # Tính SL/TP từ ATR
+            sl_price = 0.0
+            tp_price = 0.0
+            try:
+                klines = client.get_klines(symbol, "15m", 100)
+                if klines and len(klines) >= 50:
+                    df = klines_to_df(klines)
+                    c_atr = float(atr(df, 14).iloc[-1])
+                    if c_atr > 0:
+                        if side == "LONG":
+                            sl_price = round(entry - c_atr * 2.0, max(6, len(str(c_atr).split('.')[1] if '.' in str(c_atr) else 2)))
+                            tp_price = round(entry + c_atr * 2.5, max(6, len(str(c_atr).split('.')[1] if '.' in str(c_atr) else 2)))
+                        else:
+                            sl_price = round(entry + c_atr * 2.0, max(6, len(str(c_atr).split('.')[1] if '.' in str(c_atr) else 2)))
+                            tp_price = round(entry - c_atr * 2.5, max(6, len(str(c_atr).split('.')[1] if '.' in str(c_atr) else 2)))
+                        logger.info(f"  Calculated SL={sl_price} TP={tp_price} (ATR={c_atr:.6f})")
+            except Exception as e:
+                logger.debug(f"  Could not calculate SL/TP: {e}")
+
+            logger.info(f"Synced position from exchange: {side} {symbol} {abs(amt):.0f} @ {entry}")
             state_mgr.add_position(Position(
                 symbol=symbol,
                 side=side,
                 entry_price=entry,
                 quantity=abs(amt),
-                sl_price=0.0,
-                tp_price=0.0,
+                sl_price=sl_price,
+                tp_price=tp_price,
             ))
     except Exception as e:
         logger.warning(f"Failed to sync exchange positions: {e}")
