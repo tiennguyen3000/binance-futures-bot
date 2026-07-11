@@ -39,7 +39,7 @@ else:
     print(f"[Startup] {env_file} not found, using .env (mode={saved_mode})")
 
 from api_client import BinanceFuturesClient
-from state_manager import StateManager, BotState
+from state_manager import StateManager, BotState, Position
 from scanner import SmartScanner as SignalScanner
 from executor import OrderExecutor
 from telegram_notifier import (
@@ -232,6 +232,36 @@ def check_and_sync_positions(client: BinanceFuturesClient, state_mgr: StateManag
             logger.warning(f"Failed to check position {pos.symbol}: {e}")
 
 
+def sync_exchange_positions(client: BinanceFuturesClient, state_mgr: StateManager):
+    """
+    Import ANY open position từ exchange vào StateManager.
+    (Xử lý trường hợp restart bot khi còn position trên sàn)
+    """
+    logger = logging.getLogger(__name__)
+    try:
+        account = client.get_account_info()
+        for p in account.get("positions", []):
+            amt = float(p.get("positionAmt", 0))
+            if abs(amt) < 0.0001:
+                continue
+            symbol = p.get("symbol", "")
+            if state_mgr.has_position(symbol):
+                continue
+            side = "LONG" if amt > 0 else "SHORT"
+            entry = float(p.get("entryPrice", 0))
+            logger.info(f"Synced position from exchange: {side} {symbol} {abs(amt)} @ {entry}")
+            state_mgr.add_position(Position(
+                symbol=symbol,
+                side=side,
+                entry_price=entry,
+                quantity=abs(amt),
+                sl_price=0.0,
+                tp_price=0.0,
+            ))
+    except Exception as e:
+        logger.warning(f"Failed to sync exchange positions: {e}")
+
+
 # ---- Main Loop ----
 
 
@@ -272,6 +302,9 @@ def run_bot(testnet: bool = True, use_deepseek: bool = False):
         interval_trend="1h",
         max_funding_rate_pct=bot_cfg.max_funding_rate_pct,
     )
+
+    # Sync positions từ exchange (quan trọng khi restart bot)
+    sync_exchange_positions(client, state_mgr)
 
     # Khởi động Telegram command listener (polling thread)
     tg_stop = start_polling()
