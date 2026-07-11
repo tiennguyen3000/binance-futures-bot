@@ -167,7 +167,7 @@ def _action_scan() -> dict:
                 "status": "signal_found",
                 "symbol": symbol,
                 "side": signal["side"],
-                "price": signal["price"],
+                "entry_price": signal["entry_price"],
                 "rsi": round(signal["rsi"], 1),
                 "message": (
                     f"Tín hiệu {signal['side']} trên {symbol} "
