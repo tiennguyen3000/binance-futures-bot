@@ -1,0 +1,7 @@
+# Binance Futures Trading Bot — Dependencies
+python-binance>=1.0.19
+pandas>=2.0.0
+pandas-ta>=0.3.14b0
+python-dotenv>=1.0.0
+requests>=2.31.0
+openai>=1.0.0      # Required for DeepSeek integration (optional)

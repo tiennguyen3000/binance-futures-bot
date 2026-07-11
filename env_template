@@ -1,0 +1,20 @@
+# Binance Futures API Credentials
+# Get testnet keys: https://testnet.binancefuture.com/
+# Get live keys: https://www.binance.com/en/support/faq/how-to-create-api-keys-on-binance-360002502072
+
+BINANCE_API_KEY=your_api_key_here
+BINANCE_API_SECRET=your_api_secret_here
+
+# Set to "true" for testnet, "false" for live trading
+BINANCE_TESTNET=true
+
+# DeepSeek API (optional — remove if not using AI filter)
+DEEPSEEK_API_KEY=your_deepseek_api_key
+DEEPSEEK_BASE_URL=https://api.deepseek.com/v1
+
+# Bot configuration (optional overrides)
+# TRADE_CAPITAL=100
+# TRADE_LEVERAGE=3
+# MAX_POSITIONS=2
+# TOP_N_SYMBOLS=10
+# SCAN_INTERVAL=15m
