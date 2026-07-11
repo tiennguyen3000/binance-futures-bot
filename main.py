@@ -13,6 +13,7 @@ import logging
 import os
 import signal
 import sys
+import threading
 import time
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
@@ -123,52 +124,75 @@ class GracefulKiller:
         self.kill_now = True
 
 
-# ---- Position Monitoring & SL/TP ----
+# ---- Position Monitoring & SL/TP (Freqtrade pattern: dedicated monitor thread) ----
 
 
-def check_sl_tp_and_close(client: BinanceFuturesClient, state_mgr: StateManager, executor: OrderExecutor):
+def _monitor_sl_tp(client: BinanceFuturesClient, state_mgr: StateManager, executor: OrderExecutor, stop_event: threading.Event):
     """
-    Kiểm tra giá hiện tại vs SL/TP cho mỗi vị thế.
-    Nếu chạm SL hoặc TP, đóng lệnh bằng market order.
-    (Vì Binance API không hỗ trợ STOP_MARKET/TAKE_PROFIT_MARKET nữa)
+    Thread riêng kiểm tra SL/TP mỗi 5 giây (Freqtrade pattern).
+    Không block main loop, phản hồi nhanh khi chạm SL/TP.
     """
     logger = logging.getLogger(__name__)
-    for pos in list(state_mgr.get_positions()):
+    logger.info("SL/TP monitor thread started (interval=5s)")
+
+    while not stop_event.is_set():
         try:
-            price = client.get_symbol_price(pos.symbol)
-            if price <= 0:
-                continue
+            for pos in list(state_mgr.get_positions()):
+                try:
+                    price = client.get_symbol_price(pos.symbol)
+                    if price <= 0:
+                        continue
 
-            triggered = False
-            reason = ""
+                    triggered = False
+                    reason = ""
 
-            if pos.side == "LONG":
-                if pos.sl_price > 0 and price <= pos.sl_price:
-                    triggered = True
-                    reason = "sl"
-                    logger.info(f"SL TRIGGERED {pos.symbol}: {price:.2f} <= {pos.sl_price:.2f}")
-                elif pos.tp_price > 0 and price >= pos.tp_price:
-                    triggered = True
-                    reason = "tp"
-                    logger.info(f"TP TRIGGERED {pos.symbol}: {price:.2f} >= {pos.tp_price:.2f}")
-            else:  # SHORT
-                if pos.sl_price > 0 and price >= pos.sl_price:
-                    triggered = True
-                    reason = "sl"
-                    logger.info(f"SL TRIGGERED {pos.symbol}: {price:.2f} >= {pos.sl_price:.2f}")
-                elif pos.tp_price > 0 and price <= pos.tp_price:
-                    triggered = True
-                    reason = "tp"
-                    logger.info(f"TP TRIGGERED {pos.symbol}: {price:.2f} <= {pos.tp_price:.2f}")
+                    if pos.side == "LONG":
+                        if pos.sl_price > 0 and price <= pos.sl_price:
+                            triggered = True
+                            reason = "sl"
+                            logger.warning(f"🔴 SL TRIGGERED {pos.symbol}: {price:.2f} <= {pos.sl_price:.2f}")
+                        elif pos.tp_price > 0 and price >= pos.tp_price:
+                            triggered = True
+                            reason = "tp"
+                            logger.info(f"🟢 TP TRIGGERED {pos.symbol}: {price:.2f} >= {pos.tp_price:.2f}")
+                    else:  # SHORT
+                        if pos.sl_price > 0 and price >= pos.sl_price:
+                            triggered = True
+                            reason = "sl"
+                            logger.warning(f"🔴 SL TRIGGERED {pos.symbol}: {price:.2f} >= {pos.sl_price:.2f}")
+                        elif pos.tp_price > 0 and price <= pos.tp_price:
+                            triggered = True
+                            reason = "tp"
+                            logger.info(f"🟢 TP TRIGGERED {pos.symbol}: {price:.2f} <= {pos.tp_price:.2f}")
 
-            if triggered:
-                result = executor.close_position(pos.symbol)
-                if result.get("status") == "success":
-                    logger.info(f"Closed {pos.symbol} via {reason}: PnL={result.get('pnl',0):+.2f}")
-                else:
-                    logger.warning(f"Failed to close {pos.symbol} on {reason}: {result}")
+                    if triggered:
+                        result = executor.close_position(pos.symbol)
+                        if result.get("status") == "success":
+                            logger.info(f"Closed {pos.symbol} via {reason}: PnL={result.get('pnl',0):+.2f}")
+                        else:
+                            logger.warning(f"Failed to close {pos.symbol} on {reason}: {result}")
+
+                except Exception as e:
+                    logger.debug(f"SL/TP check error for {pos.symbol}: {e}")
+
         except Exception as e:
-            logger.warning(f"Failed to check SL/TP for {pos.symbol}: {e}")
+            logger.warning(f"SL/TP monitor error: {e}")
+
+        stop_event.wait(5)  # Check mỗi 5 giây
+
+    logger.info("SL/TP monitor thread stopped")
+
+
+def start_sltp_monitor(client: BinanceFuturesClient, state_mgr: StateManager, executor: OrderExecutor) -> threading.Event:
+    """Khởi động SL/TP monitor thread. Trả về stop_event."""
+    stop_event = threading.Event()
+    t = threading.Thread(
+        target=_monitor_sl_tp,
+        args=(client, state_mgr, executor, stop_event),
+        daemon=True,
+    )
+    t.start()
+    return stop_event
 
 
 def check_and_sync_positions(client: BinanceFuturesClient, state_mgr: StateManager, executor: OrderExecutor):
@@ -273,6 +297,10 @@ def run_bot(testnet: bool = True, use_deepseek: bool = False):
     killer = GracefulKiller()
     cycle_count = 0
 
+    # Khởi động SL/TP monitor thread (Freqtrade pattern — check mỗi 5s)
+    sltp_stop = start_sltp_monitor(client, state_mgr, executor)
+    logger.info("SL/TP monitor active (5s interval)")
+
     while not killer.kill_now:
         cycle_count += 1
         logger.info(f"--- Cycle {cycle_count} ---")
@@ -280,9 +308,6 @@ def run_bot(testnet: bool = True, use_deepseek: bool = False):
         try:
             # 1. Sync positions (check if any were closed externally via SL/TP)
             check_and_sync_positions(client, state_mgr, executor)
-
-            # 2. Check SL/TP tự động (vì Binance API ko support STOP_MARKET)
-            check_sl_tp_and_close(client, state_mgr, executor)
 
             # 2. Report current status
             positions = state_mgr.get_positions()
