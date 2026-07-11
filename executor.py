@@ -66,6 +66,11 @@ class OrderExecutor:
         
         # Position notional value
         position_value = (risk_amount / price_risk_pct) * self.leverage
+        # Cap theo balance: không vượt quá capital * leverage
+        max_position_value = self.capital_usdt * self.leverage
+        if position_value > max_position_value:
+            logger.debug(f"Capping position from {position_value:.2f} to {max_position_value:.2f} USDT (balance limit)")
+            position_value = max_position_value
         raw_qty = position_value / entry_price
 
         # Normalize to exchange lot size
