@@ -73,6 +73,7 @@ class BotConfig:
     mode: str = "TESTNET"
     restart_needed: bool = False
     max_positions: int = 1
+    max_funding_rate_pct: float = 0.1
     positions: list = None
     total_pnl: float = 0.0
     balance_usdt: float = 0.0
@@ -158,6 +159,14 @@ def _handle_command(text: str) -> Optional[str]:
         except (IndexError, ValueError):
             return f"📦 Số vị thế tối đa hiện tại: {config.max_positions}. Dùng: /maxpos <số> (1-5)"
 
+    if cmd.startswith("/funding") or cmd.startswith("funding"):
+        try:
+            n = float(parts[1]) if len(parts) > 1 else config.max_funding_rate_pct
+            config.max_funding_rate_pct = max(0.001, min(0.5, n))
+            return f"💸 Đã đặt funding rate tối đa = {config.max_funding_rate_pct}%. Dùng 0.05-0.5."
+        except (IndexError, ValueError):
+            return f"💸 Funding rate tối đa hiện tại: {config.max_funding_rate_pct}%. Dùng: /funding <%%> (0.001-0.5)"
+
     if cmd in ("/status", "status", "/dashboard"):
         mode_emoji = "🧪" if config.mode == "TESTNET" else "🔥"
         trading_emoji = "🟢" if config.trading_enabled else "🔴"
@@ -171,6 +180,7 @@ def _handle_command(text: str) -> Optional[str]:
             f"📦 Vị thế: {pos_count}/{config.max_positions}\n"
             f"💰 Ví: {config.balance_usdt:.2f} USDT\n"
             f"📈 PnL: {config.total_pnl:+.2f} USDT\n"
+            f"💸 Funding: <{config.max_funding_rate_pct}%\n"
             f"💵 Vốn: 100 USDT | Đòn bẩy: 10x\n"
             f"📈 SL: ATR×1.5 | TP1: ATR×2 | TP2: ATR×3\n"
             f"🤖 Bot: @tiennk_future_auto_trading_bot"
@@ -213,6 +223,7 @@ def _handle_command(text: str) -> Optional[str]:
             "/live — Chuyển live (cần restart)\n"
             "/scan 50 — Đặt số coin quét\n"
             "/maxpos 2 — Đặt số vị thế tối đa (1-5)\n"
+            "/funding 0.05 — Lọc funding rate (0.001-0.5%)\n"
             "/position — Xem vị thế đang mở\n"
             "/pnl — Tổng kết lãi lỗ\n"
             "/status — Dashboard tổng quan\n"

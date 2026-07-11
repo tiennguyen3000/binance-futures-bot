@@ -166,6 +166,8 @@ class BinanceFuturesClient:
         For LONG: side=SELL, stop_price below entry
         For SHORT: side=BUY, stop_price above entry
         Falls back to old STOP_MARKET if Algo API fails (e.g. on mainnet).
+        reduceOnly chỉ dùng khi ONE-WAY mode (ko có positionSide).
+        HEDGE mode (có positionSide) ko cần reduceOnly.
         """
         params = {
             "symbol": symbol,
@@ -173,10 +175,11 @@ class BinanceFuturesClient:
             "type": "STOP_LOSS",
             "quantity": self._normalize_qty(symbol, quantity),
             "stopPrice": self._normalize_price(symbol, stop_price),
-            "reduceOnly": True,
         }
         if position_side:
             params["positionSide"] = position_side
+        else:
+            params["reduceOnly"] = True
         result = self._request("POST", "/fapi/v1/algo/order/new", signed=True, params=params)
         if result and "clientAlgoId" in result:
             return result
@@ -187,11 +190,12 @@ class BinanceFuturesClient:
             "type": "STOP_MARKET",
             "quantity": self._normalize_qty(symbol, quantity),
             "stopPrice": self._normalize_price(symbol, stop_price),
-            "reduceOnly": True,
             "newOrderRespType": "RESULT",
         }
         if position_side:
             params["positionSide"] = position_side
+        else:
+            params["reduceOnly"] = True
         return self._request("POST", "/fapi/v1/order", signed=True, params=params)
 
     def place_take_profit(self, symbol: str, side: str, quantity: float, price: float, position_side: str = None) -> dict:
@@ -200,6 +204,7 @@ class BinanceFuturesClient:
         For LONG: side=SELL, price above entry
         For SHORT: side=BUY, price below entry
         Falls back to old TAKE_PROFIT_MARKET if Algo API fails.
+        reduceOnly chỉ dùng khi ONE-WAY mode (ko có positionSide).
         """
         params = {
             "symbol": symbol,
@@ -207,10 +212,11 @@ class BinanceFuturesClient:
             "type": "TAKE_PROFIT",
             "quantity": self._normalize_qty(symbol, quantity),
             "stopPrice": self._normalize_price(symbol, price),
-            "reduceOnly": True,
         }
         if position_side:
             params["positionSide"] = position_side
+        else:
+            params["reduceOnly"] = True
         result = self._request("POST", "/fapi/v1/algo/order/new", signed=True, params=params)
         if result and "clientAlgoId" in result:
             return result
@@ -221,11 +227,12 @@ class BinanceFuturesClient:
             "type": "TAKE_PROFIT_MARKET",
             "quantity": self._normalize_qty(symbol, quantity),
             "stopPrice": self._normalize_price(symbol, price),
-            "reduceOnly": True,
             "newOrderRespType": "RESULT",
         }
         if position_side:
             params["positionSide"] = position_side
+        else:
+            params["reduceOnly"] = True
         return self._request("POST", "/fapi/v1/order", signed=True, params=params)
 
     def cancel_all_orders(self, symbol: str) -> dict:
@@ -255,6 +262,15 @@ class BinanceFuturesClient:
         for p in positions:
             if p.get("symbol") == symbol:
                 return float(p.get("positionAmt", 0))
+        return 0.0
+
+    def get_funding_rate(self, symbol: str) -> float:
+        """Get current funding rate for a symbol (e.g. 0.0001 = 0.01%).
+        Positive = longs pay shorts, Negative = shorts pay longs.
+        """
+        data = self._request("GET", f"/fapi/v1/premiumIndex", params={"symbol": symbol})
+        if data and "lastFundingRate" in data:
+            return float(data["lastFundingRate"])
         return 0.0
 
     # ---- Helpers ----

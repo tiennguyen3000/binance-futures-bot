@@ -123,7 +123,52 @@ class GracefulKiller:
         self.kill_now = True
 
 
-# ---- Position Monitoring ----
+# ---- Position Monitoring & SL/TP ----
+
+
+def check_sl_tp_and_close(client: BinanceFuturesClient, state_mgr: StateManager, executor: OrderExecutor):
+    """
+    Kiểm tra giá hiện tại vs SL/TP cho mỗi vị thế.
+    Nếu chạm SL hoặc TP, đóng lệnh bằng market order.
+    (Vì Binance API không hỗ trợ STOP_MARKET/TAKE_PROFIT_MARKET nữa)
+    """
+    logger = logging.getLogger(__name__)
+    for pos in list(state_mgr.get_positions()):
+        try:
+            price = client.get_symbol_price(pos.symbol)
+            if price <= 0:
+                continue
+
+            triggered = False
+            reason = ""
+
+            if pos.side == "LONG":
+                if pos.sl_price > 0 and price <= pos.sl_price:
+                    triggered = True
+                    reason = "sl"
+                    logger.info(f"SL TRIGGERED {pos.symbol}: {price:.2f} <= {pos.sl_price:.2f}")
+                elif pos.tp_price > 0 and price >= pos.tp_price:
+                    triggered = True
+                    reason = "tp"
+                    logger.info(f"TP TRIGGERED {pos.symbol}: {price:.2f} >= {pos.tp_price:.2f}")
+            else:  # SHORT
+                if pos.sl_price > 0 and price >= pos.sl_price:
+                    triggered = True
+                    reason = "sl"
+                    logger.info(f"SL TRIGGERED {pos.symbol}: {price:.2f} >= {pos.sl_price:.2f}")
+                elif pos.tp_price > 0 and price <= pos.tp_price:
+                    triggered = True
+                    reason = "tp"
+                    logger.info(f"TP TRIGGERED {pos.symbol}: {price:.2f} <= {pos.tp_price:.2f}")
+
+            if triggered:
+                result = executor.close_position(pos.symbol)
+                if result.get("status") == "success":
+                    logger.info(f"Closed {pos.symbol} via {reason}: PnL={result.get('pnl',0):+.2f}")
+                else:
+                    logger.warning(f"Failed to close {pos.symbol} on {reason}: {result}")
+        except Exception as e:
+            logger.warning(f"Failed to check SL/TP for {pos.symbol}: {e}")
 
 
 def check_and_sync_positions(client: BinanceFuturesClient, state_mgr: StateManager, executor: OrderExecutor):
@@ -201,6 +246,7 @@ def run_bot(testnet: bool = True, use_deepseek: bool = False):
         top_n=bot_cfg.top_n,
         interval_entry=INTERVAL,
         interval_trend="1h",
+        max_funding_rate_pct=bot_cfg.max_funding_rate_pct,
     )
 
     # Khởi động Telegram command listener (polling thread)
@@ -235,6 +281,9 @@ def run_bot(testnet: bool = True, use_deepseek: bool = False):
             # 1. Sync positions (check if any were closed externally via SL/TP)
             check_and_sync_positions(client, state_mgr, executor)
 
+            # 2. Check SL/TP tự động (vì Binance API ko support STOP_MARKET)
+            check_sl_tp_and_close(client, state_mgr, executor)
+
             # 2. Report current status
             positions = state_mgr.get_positions()
             if positions:
@@ -252,6 +301,11 @@ def run_bot(testnet: bool = True, use_deepseek: bool = False):
             if state_mgr.max_positions != bot_cfg.max_positions:
                 state_mgr.max_positions = bot_cfg.max_positions
                 logger.info(f"Max positions updated to {bot_cfg.max_positions} via Telegram")
+
+            # Cập nhật động funding rate filter
+            if scanner.max_funding_rate_pct != bot_cfg.max_funding_rate_pct:
+                scanner.max_funding_rate_pct = bot_cfg.max_funding_rate_pct
+                logger.info(f"Funding rate filter updated to {bot_cfg.max_funding_rate_pct}% via Telegram")
 
             # Kiểm tra restart_needed (khi đổi testnet/live)
             if bot_cfg.restart_needed:

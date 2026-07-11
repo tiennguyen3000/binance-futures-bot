@@ -147,6 +147,7 @@ class SmartScanner:
         interval_entry: str = "15m",      # Khung vào lệnh
         interval_trend: str = "1h",       # Khung xác định trend
         interval_macro: str = "4h",       # Khung macro (ichimoku-like)
+        max_funding_rate_pct: float = 0.1,  # Funding rate tối đa (%)
         ema_fast: int = 9,
         ema_slow: int = 21,
         ema_trend_fast: int = 50,
@@ -170,6 +171,7 @@ class SmartScanner:
         self.ema_slow = ema_slow
         self.ema_trend_fast = ema_trend_fast
         self.ema_trend_slow = ema_trend_slow
+        self.max_funding_rate_pct = max_funding_rate_pct
         self.rsi_period = rsi_period
         self.atr_period = atr_period
         self.atr_sl_mult = atr_sl_mult
@@ -185,7 +187,7 @@ class SmartScanner:
             f"trend={interval_trend} EMA({ema_trend_fast},{ema_trend_slow}), "
             f"entry={interval_entry} RSI({rsi_range_min}-{rsi_range_max}), "
             f"ATR({atr_period}) SL={atr_sl_mult}x TP1={atr_tp1_mult}x TP2={atr_tp2_mult}x "
-            f"min_score={min_score}"
+            f"min_score={min_score} funding<{max_funding_rate_pct}%"
         )
 
     def scan(self) -> tuple[str | None, dict | None]:
@@ -315,6 +317,19 @@ class SmartScanner:
             # Swing points (entry timeframe)
             swing_low = find_swing_low(df_entry, 20)
             swing_high = find_swing_high(df_entry, 20)
+
+            # ── Funding rate filter ──
+            # Loại bỏ coin có funding rate quá cao (phí giữ lệnh đắt)
+            if self.max_funding_rate_pct < 1.0:  # 1.0 = tắt filter
+                try:
+                    fr = self.client.get_funding_rate(symbol)
+                    fr_pct = abs(fr) * 100  # Convert to %
+                    if fr_pct > self.max_funding_rate_pct:
+                        direction = "LONG" if fr > 0 else "SHORT"
+                        logger.debug(f"{symbol}: funding {fr_pct:.4f}% > max {self.max_funding_rate_pct}% ({direction} pays)")
+                        return None
+                except Exception as e:
+                    logger.debug(f"{symbol}: funding check failed ({e}), allowing")
 
             # ── Tính điểm LONG và SHORT ──
             long_score = 0
@@ -519,14 +534,26 @@ class SmartScanner:
             max_possible_score = 12  # 2+1+2+1+1+1+1+2+1(bonus)
             confidence = min(final_score / max_possible_score * 100, 100)
 
+            # ── Dynamic price precision ──
+            # coin giá thấp (SKLUSDT 0.0047) cần nhiều decimals hơn
+            def _dp(val: float) -> float:
+                if abs(val) < 0.0001:
+                    return round(val, 8)
+                elif abs(val) < 0.01:
+                    return round(val, 6)
+                elif abs(val) < 1:
+                    return round(val, 4)
+                else:
+                    return round(val, 2)
+
             signal = {
                 "side": signal_side,
-                "entry_price": round(entry_price, 2),
+                "entry_price": _dp(entry_price),
                 "rsi": round(c_rsi, 1),
                 "atr": round(c_atr, 4),
-                "sl_price": round(sl_price, 2),
-                "tp1_price": round(tp1, 2),
-                "tp2_price": round(tp2, 2),
+                "sl_price": _dp(sl_price),
+                "tp1_price": _dp(tp1),
+                "tp2_price": _dp(tp2),
                 "trend": "uptrend" if signal_side == "LONG" else "downtrend",
                 "trend_strength": 50,
                 "reason": "; ".join(reasons),
@@ -543,8 +570,8 @@ class SmartScanner:
 
             logger.debug(
                 f"{symbol} {signal_side}: score=L{long_score}/S{short_score}, "
-                f"price={entry_price:.2f}, RSI={c_rsi:.1f}, ATR={c_atr:.4f}, "
-                f"SL={sl_price:.2f}, TP1={tp1:.2f}, TP2={tp2:.2f}, R:R={rr1:.1f}, "
+                f"price={_dp(entry_price)}, RSI={c_rsi:.1f}, ATR={c_atr:.4f}, "
+                f"SL={_dp(sl_price)}, TP1={_dp(tp1)}, TP2={_dp(tp2)}, R:R={rr1:.1f}, "
                 f"reasons={reasons[:3]}"
             )
 
