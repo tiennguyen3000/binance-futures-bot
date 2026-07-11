@@ -46,7 +46,7 @@ from telegram_notifier import (
     send_message, signal_msg, entry_msg, exit_msg,
     status_msg, error_msg, bot_start_msg, bot_stop_msg,
 )
-from bot_controller import config as bot_cfg, start_polling, send_tg
+from bot_controller import config as bot_cfg, start_polling, send_tg, set_fetchers as tg_set_fetchers
 from api_server import start_api_thread, set_fetchers
 
 # ---- Configuration ----
@@ -317,6 +317,12 @@ def run_bot(testnet: bool = True, use_deepseek: bool = False):
         executor=executor,
     )
     api_thread = start_api_thread(host="0.0.0.0", port=8765)
+
+    # Inject callbacks cho Telegram commands (real-time data)
+    tg_set_fetchers(
+        positions_fn=lambda: executor.get_positions_with_pnl(),
+        balance_fn=lambda: client.get_balance("USDT"),
+    )
 
     # Optional DeepSeek integration
     deepseek_filter = None

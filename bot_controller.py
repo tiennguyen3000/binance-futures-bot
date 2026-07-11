@@ -65,6 +65,18 @@ def load_saved_mode() -> str:
 
 # ─── Shared state ───────────────────────────────────────────────
 
+# Callbacks để lấy dữ liệu real-time từ Binance (được main.py inject)
+_positions_cb = lambda: []
+_balance_cb = lambda: 0.0
+
+
+def set_fetchers(positions_fn, balance_fn):
+    """Gắn callback lấy dữ liệu real-time từ executor/client."""
+    global _positions_cb, _balance_cb
+    _positions_cb = positions_fn
+    _balance_cb = balance_fn
+
+
 @dataclass
 class BotConfig:
     """Trạng thái có thể thay đổi động của bot."""
@@ -171,15 +183,19 @@ def _handle_command(text: str) -> Optional[str]:
         mode_emoji = "🧪" if config.mode == "TESTNET" else "🔥"
         trading_emoji = "🟢" if config.trading_enabled else "🔴"
         warn = "\n⚠️ Cần restart để đổi mode!" if config.restart_needed else ""
-        pos_count = len(config.positions) if config.positions else 0
+        # Dữ liệu real-time từ Binance
+        positions = _positions_cb()
+        balance = _balance_cb()
+        pos_count = len(positions)
+        total_pnl = sum(p.get("unrealized_pnl", 0) for p in positions)
         return (
             f"📊 <b>BOT DASHBOARD</b>{warn}\n"
             f"{mode_emoji} Mode: {config.mode}\n"
             f"{trading_emoji} Giao dịch: {'BẬT' if config.trading_enabled else 'TẮT'}\n"
             f"🔍 Quét: top {config.top_n} coins\n"
             f"📦 Vị thế: {pos_count}/{config.max_positions}\n"
-            f"💰 Ví: {config.balance_usdt:.2f} USDT\n"
-            f"📈 PnL: {config.total_pnl:+.2f} USDT\n"
+            f"💰 Ví: {balance:.2f} USDT\n"
+            f"📈 PnL: {total_pnl:+.2f} USDT\n"
             f"💸 Funding: &lt;{config.max_funding_rate_pct}%\n"
             f"💵 Vốn: 100 USDT | Đòn bẩy: 10x\n"
             f"📈 SL: ATR×1.5 | TP1: ATR×2 | TP2: ATR×3\n"
@@ -187,30 +203,33 @@ def _handle_command(text: str) -> Optional[str]:
         )
 
     if cmd in ("/position", "position", "/positions"):
-        if not config.positions:
+        positions = _positions_cb()
+        if not positions:
             return "📭 <b>Không có vị thế nào</b> — bot đang quét tìm tín hiệu."
         lines = ["📦 <b>VỊ THẾ ĐANG MỞ</b>"]
-        for p in config.positions:
+        for p in positions:
             emoji = "🟢" if p.get("side") == "LONG" else "🔴"
             lines.append(
                 f"{emoji} {p['symbol']} {p['side']}\n"
-                f"  • Vào: {p['entry_price']:.2f}\n"
-                f"  • SL: {p['sl_price']:.2f} | TP: {p['tp_price']:.2f}\n"
+                f"  • Vào: {p['entry_price']:.4f}\n"
+                f"  • SL: {p['sl_price']:.4f} | TP: {p['tp_price']:.4f}\n"
                 f"  • PnL: {p.get('unrealized_pnl',0):+.2f} USDT ({p.get('roi_pct',0):+.2f}%)"
             )
         return "\n".join(lines)
 
     if cmd in ("/pnl", "pnl", "/profit"):
-        if not config.positions:
-            return f"📊 <b>TỔNG KẾT</b>\n💰 Ví: {config.balance_usdt:.2f} USDT\n📈 PnL: {config.total_pnl:+.2f} USDT\n📭 Không có vị thế mở."
+        balance = _balance_cb()
+        positions = _positions_cb()
+        if not positions:
+            return f"📊 <b>TỔNG KẾT</b>\n💰 Ví: {balance:.2f} USDT\n📈 Tổng PnL: +0.00 USDT\n📭 Không có vị thế mở."
         lines = ["📊 <b>TỔNG KẾT P&L</b>"]
         total_pnl = 0.0
-        for p in config.positions:
+        for p in positions:
             pnl = p.get("unrealized_pnl", 0)
             total_pnl += pnl
             emoji = "📈" if pnl >= 0 else "📉"
             lines.append(f"{emoji} {p['symbol']}: {pnl:+.2f} USDT ({p.get('roi_pct',0):+.2f}%)")
-        lines.append(f"\n💰 Ví: {config.balance_usdt:.2f} USDT")
+        lines.append(f"\n💰 Ví: {balance:.2f} USDT")
         lines.append(f"{'📈' if total_pnl>=0 else '📉'} <b>Tổng PnL: {total_pnl:+.2f} USDT</b>")
         return "\n".join(lines)
 
