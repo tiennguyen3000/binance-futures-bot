@@ -188,7 +188,7 @@ def run_bot(testnet: bool = True, use_deepseek: bool = False):
 
     # Initialize components
     client = BinanceFuturesClient(testnet=testnet)
-    state_mgr = StateManager(max_positions=MAX_POSITIONS)
+    state_mgr = StateManager(max_positions=bot_cfg.max_positions)
     executor = OrderExecutor(
         client=client,
         state_mgr=state_mgr,
@@ -247,6 +247,11 @@ def run_bot(testnet: bool = True, use_deepseek: bool = False):
             if scanner.top_n != bot_cfg.top_n:
                 scanner.top_n = bot_cfg.top_n
                 logger.info(f"Top N updated to {bot_cfg.top_n} via Telegram")
+
+            # Cập nhật động số vị thế tối đa
+            if state_mgr.max_positions != bot_cfg.max_positions:
+                state_mgr.max_positions = bot_cfg.max_positions
+                logger.info(f"Max positions updated to {bot_cfg.max_positions} via Telegram")
 
             # Kiểm tra restart_needed (khi đổi testnet/live)
             if bot_cfg.restart_needed:

@@ -72,6 +72,7 @@ class BotConfig:
     top_n: int = 30
     mode: str = "TESTNET"
     restart_needed: bool = False
+    max_positions: int = 1
     positions: list = None
     total_pnl: float = 0.0
     balance_usdt: float = 0.0
@@ -149,6 +150,14 @@ def _handle_command(text: str) -> Optional[str]:
         except (IndexError, ValueError):
             return f"🔍 Số coin hiện tại: {config.top_n}. Dùng: /scan <số> (5-100)"
 
+    if cmd.startswith("/maxpos") or cmd.startswith("maxpos"):
+        try:
+            n = int(parts[1]) if len(parts) > 1 else config.max_positions
+            config.max_positions = max(1, min(5, n))
+            return f"📦 Đã đặt số vị thế tối đa = {config.max_positions}."
+        except (IndexError, ValueError):
+            return f"📦 Số vị thế tối đa hiện tại: {config.max_positions}. Dùng: /maxpos <số> (1-5)"
+
     if cmd in ("/status", "status", "/dashboard"):
         mode_emoji = "🧪" if config.mode == "TESTNET" else "🔥"
         trading_emoji = "🟢" if config.trading_enabled else "🔴"
@@ -159,7 +168,7 @@ def _handle_command(text: str) -> Optional[str]:
             f"{mode_emoji} Mode: {config.mode}\n"
             f"{trading_emoji} Giao dịch: {'BẬT' if config.trading_enabled else 'TẮT'}\n"
             f"🔍 Quét: top {config.top_n} coins\n"
-            f"📦 Vị thế: {pos_count}/1\n"
+            f"📦 Vị thế: {pos_count}/{config.max_positions}\n"
             f"💰 Ví: {config.balance_usdt:.2f} USDT\n"
             f"📈 PnL: {config.total_pnl:+.2f} USDT\n"
             f"💵 Vốn: 100 USDT | Đòn bẩy: 10x\n"
@@ -203,6 +212,7 @@ def _handle_command(text: str) -> Optional[str]:
             "/testnet — Chuyển testnet (cần restart)\n"
             "/live — Chuyển live (cần restart)\n"
             "/scan 50 — Đặt số coin quét\n"
+            "/maxpos 2 — Đặt số vị thế tối đa (1-5)\n"
             "/position — Xem vị thế đang mở\n"
             "/pnl — Tổng kết lãi lỗ\n"
             "/status — Dashboard tổng quan\n"

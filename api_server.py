@@ -32,6 +32,7 @@ except ImportError:
         top_n: int = 30
         mode: str = "TESTNET"
         restart_needed: bool = False
+        max_positions: int = 1
     bot_cfg = _C()
     def send_tg(t): pass
     def _handle_command(t): return None
@@ -91,6 +92,7 @@ class APIHandler(BaseHTTPRequestHandler):
                 "trading_enabled": bot_cfg.trading_enabled,
                 "mode": bot_cfg.mode,
                 "top_n": bot_cfg.top_n,
+                "max_positions": bot_cfg.max_positions,
                 "active_positions": len(positions),
                 "balance_usdt": round(_balance_fn(), 2),
                 "restart_needed": bot_cfg.restart_needed,
