@@ -1,0 +1,24 @@
+# Secrets — không build vào image
+.env
+.env.live
+.env.*
+.bot_state/
+logs/
+
+# Python
+__pycache__/
+*.py[cod]
+venv/
+*.egg-info/
+
+# Git
+.git/
+.gitignore
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/

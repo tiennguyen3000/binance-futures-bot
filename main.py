@@ -280,7 +280,7 @@ def run_bot(testnet: bool = True, use_deepseek: bool = False):
                     if deepseek_filter:
                         logger.info(f"Checking signal with DeepSeek AI...")
                         verdict = deepseek_filter(
-                            symbol, signal, signal["price"], signal["rsi"]
+                            symbol, signal, signal["entry_price"], signal["rsi"]
                         )
                         logger.info(f"DeepSeek verdict: {verdict}")
                         if verdict and verdict.lower().startswith("no"):
@@ -370,7 +370,7 @@ def quick_test_run(testnet: bool = True):
         # Test single scan
         symbol, signal = scanner.scan()
         if symbol:
-            logger.info(f"Signal found: {signal['side']} {symbol} @ {signal['price']} RSI={signal['rsi']:.1f}")
+            logger.info(f"Signal found: {signal['side']} {symbol} @ {signal['entry_price']} RSI={signal['rsi']:.1f}")
         else:
             logger.info("No signal in current scan")
     except Exception as e:
