@@ -7,7 +7,8 @@ A Binance USD-M Futures bot designed for testnet-first operation. This project c
 - Default: `TRADING_ENABLED=false`; signals may be scanned but no entries are submitted.
 - Default REST binding is `127.0.0.1`; Docker Compose intentionally publishes no host port.
 - Mutating REST calls require both `ENABLE_API_MUTATIONS=true` and a matching `Authorization: Bearer <API_CONTROL_TOKEN>` header.
-- An entry is considered successful only after exchange-side stop-loss acceptance. If SL placement fails, the executor attempts an emergency reduce-only close.
+- An entry is considered successful only after exchange-side stop-loss **and TP1** acceptance. If either protection order fails, the executor attempts an emergency reduce-only close; an unconfirmed close becomes `UNKNOWN` exposure and `SAFE_HALT`.
+- Price and quantity are quantized from Binance symbol filters with fixed-point `Decimal` strings. Orders below `minQty` or `MIN_NOTIONAL`/`NOTIONAL` are rejected before submission.
 - On startup, every exchange position must have an exchange-native stop. An unknown/unprotected position puts the bot into `SAFE_HALT`, disabling new entries.
 - Position size is risk-based from available USDT and entry-to-stop distance, then capped by 10% equity margin allocation at configured leverage.
 - The scanner calculates signals using completed candles only. It excludes the in-progress Binance kline.

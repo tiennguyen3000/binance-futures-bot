@@ -26,6 +26,13 @@ def _positive_int(name: str, default: int) -> int:
     return value
 
 
+def _fraction(name: str, default: float, maximum: float = 1.0) -> float:
+    value = _positive_float(name, default)
+    if value > maximum:
+        raise ValueError(f"{name} must be no greater than {maximum}")
+    return value
+
+
 @dataclass(frozen=True)
 class BotSettings:
     trading_enabled: bool
@@ -39,6 +46,7 @@ class BotSettings:
     risk_per_trade: float
     max_position_notional_pct: float
     scan_interval_seconds: int
+    capital_usdt: float
 
     @classmethod
     def from_env(cls) -> "BotSettings":
@@ -53,7 +61,8 @@ class BotSettings:
             testnet=_bool("BINANCE_TESTNET", True),
             leverage=_positive_int("TRADE_LEVERAGE", 10),
             max_positions=_positive_int("MAX_POSITIONS", 1),
-            risk_per_trade=_positive_float("RISK_PER_TRADE", 0.015),
-            max_position_notional_pct=_positive_float("MAX_POSITION_NOTIONAL_PCT", 0.10),
+            risk_per_trade=_fraction("RISK_PER_TRADE", 0.015, 0.05),
+            max_position_notional_pct=_fraction("MAX_POSITION_NOTIONAL_PCT", 0.10, 1.0),
             scan_interval_seconds=_positive_int("SCAN_INTERVAL_SECONDS", 120),
+            capital_usdt=_positive_float("CAPITAL_USDT", 100.0),
         )

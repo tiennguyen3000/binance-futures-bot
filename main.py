@@ -168,8 +168,9 @@ def check_and_sync_positions(client: BinanceFuturesClient, state_mgr: StateManag
     for pos in list(state_mgr.get_positions()):
         try:
             amt = client.get_position_amt(pos.symbol)
-            # If position no longer exists on exchange (closed via SL/TP)
-            if abs(amt) < 0.0001:
+            # A non-zero exchange amount remains exposure regardless of symbol
+            # precision. get_position_amt is the authoritative signed value.
+            if abs(amt) == 0:
                 logger = logging.getLogger(__name__)
                 logger.info(f"Position {pos.symbol} closed on exchange (amt=0), removing from tracker")
                 
@@ -263,13 +264,17 @@ def reconcile_exchange_positions(client: BinanceFuturesClient, state_mgr: StateM
 
 def run_bot(testnet: bool = True, use_deepseek: bool = False):
     logger = logging.getLogger(__name__)
+    # Runtime settings are the source of truth; legacy constants remain only as CLI defaults.
+    runtime_settings = BotSettings.from_env()
+    bot_cfg.trading_enabled = runtime_settings.trading_enabled
+    bot_cfg.max_positions = runtime_settings.max_positions
     logger.info("=" * 60)
     logger.info(f"Binance Futures Trading Bot Starting...")
     logger.info(f"Mode: {'TESTNET' if testnet else 'LIVE'}")
-    logger.info(f"Scan interval: {SCAN_INTERVAL_SECONDS}s")
-    logger.info(f"Max positions: {MAX_POSITIONS}")
-    logger.info(f"Capital: {CAPITAL_USDT} USDT, Risk/trade: {RISK_PER_TRADE*100:.0f}%")
-    logger.info(f"Leverage: {LEVERAGE}x, SL: {SL_DISTANCE*100:.0f}%, TP: {TP_DISTANCE*100:.0f}%")
+    logger.info(f"Max positions: {runtime_settings.max_positions}")
+    logger.info(f"Capital allocation: {runtime_settings.capital_usdt} USDT, Risk/trade: {runtime_settings.risk_per_trade*100:.2f}%")
+    logger.info(f"Leverage: {runtime_settings.leverage}x, SL: ATR-based, TP: ATR-based")
+    logger.info(f"Scan interval: {runtime_settings.scan_interval_seconds}s")
     if use_deepseek:
         logger.info("DeepSeek AI filter: ENABLED")
     logger.info("=" * 60)
@@ -277,22 +282,17 @@ def run_bot(testnet: bool = True, use_deepseek: bool = False):
     # Telegram startup notification
     send_message(bot_start_msg(
         mode="TESTNET" if testnet else "LIVE",
-        capital=CAPITAL_USDT,
-        leverage=LEVERAGE,
+        capital=runtime_settings.capital_usdt,
+        leverage=runtime_settings.leverage,
     ))
 
-    # Runtime settings are the source of truth; legacy constants remain only as CLI defaults.
-    runtime_settings = BotSettings.from_env()
-    bot_cfg.trading_enabled = runtime_settings.trading_enabled
-    bot_cfg.max_positions = runtime_settings.max_positions
-
-    # Initialize components
+    # Settings were resolved before startup logging.
     client = BinanceFuturesClient(testnet=testnet)
     state_mgr = StateManager(max_positions=bot_cfg.max_positions)
     executor = OrderExecutor(
         client=client,
         state_mgr=state_mgr,
-        capital_usdt=CAPITAL_USDT,
+        capital_usdt=runtime_settings.capital_usdt,
         risk_per_trade=runtime_settings.risk_per_trade,
         leverage=runtime_settings.leverage,
         max_position_notional_pct=runtime_settings.max_position_notional_pct,
@@ -305,18 +305,18 @@ def run_bot(testnet: bool = True, use_deepseek: bool = False):
         max_funding_rate_pct=bot_cfg.max_funding_rate_pct,
     )
 
-    try:
-        client.assert_one_way_mode()
-    except Exception as exc:
-        state_mgr.safe_halt(f"Cannot verify One-way position mode: {exc}")
-        raise RuntimeError("Startup aborted: Binance account must use One-way Mode") from exc
-
-    # Synchronize before signed requests and refuse to proceed if Binance time cannot be read.
+    # Synchronize before every signed startup request, including position-mode detection.
     try:
         client.sync_time()
     except Exception as exc:
         state_mgr.safe_halt(f"Cannot synchronize Binance server time: {exc}")
         raise RuntimeError("Startup aborted: Binance time synchronization failed") from exc
+
+    try:
+        client.assert_one_way_mode()
+    except Exception as exc:
+        state_mgr.safe_halt(f"Cannot verify One-way position mode: {exc}")
+        raise RuntimeError("Startup aborted: Binance account must use One-way Mode") from exc
 
     # Reconcile first; never start entries while exchange exposure is unknown.
     reconciliation = reconcile_exchange_positions(client, state_mgr)
@@ -402,20 +402,27 @@ def run_bot(testnet: bool = True, use_deepseek: bool = False):
                 # Kiểm tra trading_enabled từ Telegram command
                 if not bot_cfg.trading_enabled:
                     logger.info("Trading is DISABLED via Telegram. Skipping entry.")
-                    time.sleep(SCAN_INTERVAL_SECONDS)
+                    time.sleep(runtime_settings.scan_interval_seconds)
                     continue
 
                 state_mgr.set_state(BotState.SCANNING)
 
-                # Check balance before scanning
+                # Sizing and exchange filters decide feasibility per symbol; a fixed
+                # account-wide balance threshold would incorrectly reject low-notional contracts.
                 balance = client.get_balance("USDT")
                 logger.info(f"USDT Balance: {balance:.2f}")
-                if balance < 50:
-                    logger.warning(f"Balance too low ({balance:.2f} USDT), skipping scan")
-                    time.sleep(SCAN_INTERVAL_SECONDS)
+                if balance <= 0:
+                    logger.warning("No available USDT balance; skipping scan")
+                    time.sleep(runtime_settings.scan_interval_seconds)
                     continue
 
-                symbol, signal = scanner.scan()
+                symbol, signal = scanner.scan(eligible=lambda candidate, candidate_signal: executor.can_execute_signal(
+                    candidate,
+                    candidate_signal["side"],
+                    candidate_signal["entry_price"],
+                    candidate_signal["sl_price"],
+                    candidate_signal["tp1_price"],
+                ))
 
                 if symbol and signal:
                     # Optional DeepSeek filter
@@ -427,7 +434,7 @@ def run_bot(testnet: bool = True, use_deepseek: bool = False):
                         logger.info(f"DeepSeek verdict: {verdict}")
                         if verdict and verdict.lower().startswith("no"):
                             logger.info(f"DeepSeek rejected signal for {symbol}, skipping")
-                            time.sleep(SCAN_INTERVAL_SECONDS)
+                            time.sleep(runtime_settings.scan_interval_seconds)
                             continue
 
                     # Execute trade with ATR-based SL/TP from scanner
@@ -468,7 +475,7 @@ def run_bot(testnet: bool = True, use_deepseek: bool = False):
             send_message(error_msg("Main loop error", str(e)))
 
         # Sleep between cycles (unless interrupted)
-        for _ in range(SCAN_INTERVAL_SECONDS):
+        for _ in range(runtime_settings.scan_interval_seconds):
             if killer.kill_now:
                 break
             time.sleep(1)
@@ -568,10 +575,10 @@ def main():
     # Setup logging
     logger = setup_logging(verbose=args.verbose)
 
-    # Auto-detect mode: ưu tiên saved_mode từ .bot_state/mode.json
-    # (đã được set bởi Telegram /live hoặc /testnet),
-    # --live CLI flag ghi đè nếu được truyền.
-    testnet = not (args.live or saved_mode == "LIVE")
+    # Mode is resolved from the loaded environment. --live is an explicit CLI
+    # override; a saved Telegram mode only selects which env file is loaded.
+    runtime_settings = BotSettings.from_env()
+    testnet = False if args.live else runtime_settings.testnet
 
     if args.test:
         quick_test_run(testnet=testnet)

@@ -86,8 +86,12 @@ class SmartScanner:
         # Ask more than N before filtering stablecoins, then cap the valid universe.
         return [item["symbol"] for item in self.client.get_top_volume_symbols(limit=self.top_n * 2) if not is_stablecoin(item.get("symbol", ""))][:self.top_n]
 
-    def scan(self) -> tuple[str | None, dict | None]:
-        signals = [(symbol, signal) for symbol in self._get_top_symbols() if (signal := self._evaluate(symbol))]
+    def scan(self, eligible=None) -> tuple[str | None, dict | None]:
+        signals = []
+        for symbol in self._get_top_symbols():
+            signal = self._evaluate(symbol)
+            if signal and (eligible is None or eligible(symbol, signal)):
+                signals.append((symbol, signal))
         if not signals:
             return None, None
         return max(signals, key=lambda item: item[1]["confidence"])
@@ -99,14 +103,26 @@ class SmartScanner:
         closed = self._closed(klines_to_df(raw))
         return closed if len(closed) >= self.ema_trend_slow + 1 else None
 
+    def _funding_is_acceptable(self, symbol: str) -> bool:
+        funding_rate = self.client.get_funding_rate(symbol)
+        if funding_rate is None:
+            logger.warning("Skipping %s because funding cannot be verified", symbol)
+            return False
+        return abs(funding_rate) * 100 <= self.max_funding_rate_pct
+
+    @staticmethod
+    def _prior_range(frame: pd.DataFrame, periods: int) -> tuple[float, float]:
+        if len(frame) < periods + 1:
+            raise ValueError("Insufficient macro candles for prior range")
+        preceding = frame.iloc[-(periods + 1):-1]
+        return float(preceding["high"].max()), float(preceding["low"].min())
+
     def _evaluate(self, symbol: str) -> dict | None:
         try:
             entry, trend, macro = self._get_df(symbol, self.interval_entry), self._get_df(symbol, self.interval_trend), self._get_df(symbol, self.interval_macro)
-            if entry is None or trend is None:
+            if entry is None or trend is None or macro is None:
                 return None
-            macro = macro if macro is not None else trend
-            funding = abs(self.client.get_funding_rate(symbol)) * 100
-            if funding > self.max_funding_rate_pct:
+            if not self._funding_is_acceptable(symbol):
                 return None
             close, trend_close = entry["close"], trend["close"]
             price, trend_price = float(close.iloc[-1]), float(trend_close.iloc[-1])
@@ -127,7 +143,7 @@ class SmartScanner:
             if ratio >= 1.5:
                 if price >= e9: long += 1; reasons_long.append(f"closed volume spike x{ratio:.1f}")
                 else: short += 1; reasons_short.append(f"closed volume spike x{ratio:.1f}")
-            high52, low52 = float(macro["high"].tail(52).max()), float(macro["low"].tail(52).min())
+            high52, low52 = self._prior_range(macro, 52)
             if price > high52: long += 1; reasons_long.append("52-period range breakout")
             elif price < low52: short += 1; reasons_short.append("52-period range breakdown")
             if price > e21 + atr_value * .5: long += 1; reasons_long.append("ATR trend up")

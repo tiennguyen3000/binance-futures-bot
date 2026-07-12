@@ -14,6 +14,8 @@ class OneWayClient:
     def get_symbol_price(self, symbol): return 100.0
     def get_balance(self, asset): return 100.0
     def _normalize_qty(self, symbol, quantity): return quantity
+    def validate_order_notional(self, symbol, quantity, price): return None
+    def normalize_protection_prices(self, symbol, side, sl, tp): return str(sl), str(tp)
     def place_market_order(self, *args, **kwargs):
         self.position_sides.append(kwargs.get("position_side"))
         return {"orderId": "entry-1", "avgPrice": "100", "executedQty": "1"}

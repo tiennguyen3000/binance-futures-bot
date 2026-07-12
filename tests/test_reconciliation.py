@@ -28,6 +28,20 @@ class ReconciliationTests(unittest.TestCase):
         self.assertEqual(95.0, position.sl_price)
         self.assertEqual(110.0, position.tp_price)
 
+    def test_small_nonzero_exchange_position_is_not_removed_and_does_not_free_capacity(self):
+        from main import check_and_sync_positions
+        from state_manager import Position
+
+        class SmallPositionClient:
+            def get_position_amt(self, symbol): return 0.00005
+            def get_position_risk(self, symbol): return []
+
+        state = StateManager(max_positions=1)
+        state.add_position(Position("BTCUSDT", "LONG", 100, 0.00005, 95, 110))
+        check_and_sync_positions(SmallPositionClient(), state, executor=None)
+        self.assertIsNotNone(state.get_position("BTCUSDT"))
+        self.assertFalse(state.can_open())
+
 
 if __name__ == "__main__":
     unittest.main()

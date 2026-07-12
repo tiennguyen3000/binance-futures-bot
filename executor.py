@@ -31,13 +31,31 @@ class OrderExecutor:
     def calculate_position_size(self, symbol: str, entry_price: float, sl_price: float, balance: float | None = None) -> float:
         if entry_price <= 0 or sl_price <= 0 or entry_price == sl_price:
             return 0.0
-        equity = balance if balance is not None else self.client.get_balance("USDT")
+        available_balance = balance if balance is not None else self.client.get_balance("USDT")
+        # capital_usdt is an explicit strategy allocation, never a display-only value.
+        equity = min(available_balance, self.capital_usdt)
         risk_budget = equity * self.risk_per_trade
         risk_per_unit = abs(entry_price - sl_price)
         risk_qty = risk_budget / risk_per_unit
         notional_cap = equity * self.leverage * self.max_position_notional_pct
         capped_qty = min(risk_qty, notional_cap / entry_price)
-        return max(self.client._normalize_qty(symbol, capped_qty), 0.0)
+        normalized = self.client._normalize_qty(symbol, capped_qty)
+        return max(float(normalized), 0.0)
+
+    def can_execute_signal(self, symbol: str, side: str, entry_price: float, sl_price: float, tp1_price: float) -> bool:
+        """Pure preflight used by the scanner to exclude signals that cannot be ordered."""
+        if not self.client.is_tradable(symbol):
+            return False
+        try:
+            normalized_sl, normalized_tp = self.client.normalize_protection_prices(symbol, side, sl_price, tp1_price)
+            stop, target = float(normalized_sl), float(normalized_tp)
+            valid = stop > 0 and target > 0 and (stop < entry_price < target if side == "LONG" else target < entry_price < stop)
+            if not valid:
+                return False
+            quantity = self.calculate_position_size(symbol, entry_price, stop)
+            return quantity > 0 and not self.client.validate_order_notional(symbol, quantity, entry_price)
+        except (ArithmeticError, TypeError, ValueError):
+            return False
 
     def _emergency_close(self, symbol: str, side: str, quantity: float) -> bool:
         close_side = "SELL" if side == "LONG" else "BUY"
@@ -69,9 +87,17 @@ class OrderExecutor:
             if margin_result.get("_error") or (margin_result.get("code") and margin_result.get("code") != -4046):
                 return {"status": "error", "message": f"Margin configuration failed: {margin_result}"}
             requested_price = self.client.get_symbol_price(symbol)
+            normalized_sl, normalized_tp = self.client.normalize_protection_prices(symbol, side, sl_price, tp1_price)
+            sl_price, tp1_price = float(normalized_sl), float(normalized_tp)
+            valid_requested = sl_price > 0 and tp1_price > 0 and (sl_price < requested_price < tp1_price if side == "LONG" else tp1_price < requested_price < sl_price)
+            if not valid_requested:
+                return {"status": "error", "message": "Tick-normalized SL/TP is invalid for the requested price"}
             quantity = self.calculate_position_size(symbol, requested_price, sl_price)
             if quantity <= 0:
                 return {"status": "error", "message": "Quantity is below exchange minimum"}
+            notional_error = self.client.validate_order_notional(symbol, quantity, requested_price)
+            if notional_error:
+                return {"status": "error", "message": notional_error}
             order_side, close_side = ("BUY", "SELL") if side == "LONG" else ("SELL", "BUY")
             # This bot intentionally supports One-way Mode only. Position mode is
             # asserted at startup, so omission of positionSide is deliberate.
@@ -106,7 +132,15 @@ class OrderExecutor:
                 return {"status": "error", "message": "Stop-loss rejected; emergency close confirmed"}
             take_profit = self.client.place_take_profit(symbol, close_side, filled_qty, tp1_price, position_side=position_side)
             tp_id = self._exchange_id(take_profit)
-            position = Position(symbol, side, filled_price, filled_qty, sl_price, tp1_price, str(entry_id), str(stop_id), str(tp_id) if tp_id else None)
+            if not tp_id:
+                closed = self._emergency_close(symbol, side, filled_qty)
+                if not closed:
+                    self._halt_unknown_exposure(Position(symbol, side, filled_price, filled_qty, sl_price, tp1_price, str(entry_id), str(stop_id)), "take-profit rejected and emergency close unconfirmed")
+                    return {"status": "error", "message": "Take-profit rejected; emergency close unconfirmed; SAFE_HALT"}
+                # Position is confirmed flat; only now remove the accepted stop.
+                self.client.cancel_order(symbol, str(stop_id))
+                return {"status": "error", "message": "Take-profit rejected; emergency close confirmed"}
+            position = Position(symbol, side, filled_price, filled_qty, sl_price, tp1_price, str(entry_id), str(stop_id), str(tp_id))
             if not self.state_mgr.add_position(position):
                 closed = self._emergency_close(symbol, side, filled_qty)
                 if not closed:

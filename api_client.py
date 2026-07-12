@@ -7,7 +7,7 @@ import logging
 import os
 import time
 import uuid
-from decimal import Decimal, ROUND_DOWN
+from decimal import Decimal, ROUND_DOWN, ROUND_UP
 from typing import Any
 from urllib.parse import urlencode
 
@@ -149,8 +149,15 @@ class BinanceFuturesClient:
             params["reduceOnly"] = "true"
         return self._order(params, "entry" if not reduce_only else "exit")
 
-    def _conditional_order(self, symbol: str, side: str, quantity: float, trigger_price: float, position_side: str | None, order_type: str) -> dict:
-        params: dict[str, Any] = {"symbol": symbol, "side": side, "type": order_type, "quantity": self._normalize_qty(symbol, quantity), "stopPrice": self._normalize_price(symbol, trigger_price), "workingType": "MARK_PRICE"}
+    def _conditional_order(self, symbol: str, side: str, quantity: float, trigger_price: float, position_side: str | None, order_type: str, rounding: str) -> dict:
+        params: dict[str, Any] = {
+            "symbol": symbol,
+            "side": side,
+            "type": order_type,
+            "quantity": self._normalize_qty(symbol, quantity),
+            "stopPrice": self._normalize_price(symbol, trigger_price, rounding),
+            "workingType": "MARK_PRICE",
+        }
         if position_side:
             params["positionSide"] = position_side
         else:
@@ -158,10 +165,12 @@ class BinanceFuturesClient:
         return self._order(params, order_type.lower())
 
     def place_stop_loss(self, symbol: str, side: str, quantity: float, stop_price: float, position_side: str | None = None) -> dict:
-        return self._conditional_order(symbol, side, quantity, stop_price, position_side, "STOP_MARKET")
+        # SELL protects a long below market; BUY protects a short above market.
+        return self._conditional_order(symbol, side, quantity, stop_price, position_side, "STOP_MARKET", "floor" if side == "SELL" else "ceil")
 
     def place_take_profit(self, symbol: str, side: str, quantity: float, price: float, position_side: str | None = None) -> dict:
-        return self._conditional_order(symbol, side, quantity, price, position_side, "TAKE_PROFIT_MARKET")
+        # SELL TP for long must remain above entry; BUY TP for short below entry.
+        return self._conditional_order(symbol, side, quantity, price, position_side, "TAKE_PROFIT_MARKET", "ceil" if side == "SELL" else "floor")
 
     def get_order_by_client_id(self, symbol: str, client_order_id: str) -> dict:
         """Resolve an unknown submit outcome without sending another market order."""
@@ -207,26 +216,57 @@ class BinanceFuturesClient:
             raise RuntimeError("Hedge-mode positions are not supported; operator intervention required")
         return sum(float(item.get("positionAmt", 0)) for item in matching)
 
-    def get_funding_rate(self, symbol: str) -> float:
+    def get_funding_rate(self, symbol: str) -> float | None:
         data = self._request("GET", "/fapi/v1/premiumIndex", params={"symbol": symbol})
-        return float(data.get("lastFundingRate", 0)) if isinstance(data, dict) else 0.0
+        if not isinstance(data, dict) or data.get("_error") or "lastFundingRate" not in data:
+            logger.warning("Cannot read funding rate for %s: %s", symbol, data)
+            return None
+        try:
+            return float(data["lastFundingRate"])
+        except (TypeError, ValueError):
+            logger.warning("Invalid funding rate for %s: %s", symbol, data)
+            return None
 
     def _filter(self, symbol: str, filter_type: str) -> dict:
         return next((item for item in self.get_symbol_info(symbol).get("filters", []) if item.get("filterType") == filter_type), {})
 
-    def _normalize(self, value: float, step: str) -> float:
-        decimal_step = Decimal(step)
+    @staticmethod
+    def _decimal_string(value: Decimal) -> str:
+        return format(value, "f")
+
+    def _normalize(self, value: float | Decimal, step: str, rounding: str = "floor") -> Decimal:
+        decimal_step = Decimal(str(step))
         if decimal_step <= 0:
-            return float(value)
+            return Decimal(str(value))
         value_decimal = Decimal(str(value))
-        normalized = (value_decimal // decimal_step) * decimal_step
-        return float(normalized)
+        units = value_decimal / decimal_step
+        integral = units.to_integral_value(rounding=ROUND_DOWN if rounding == "floor" else ROUND_UP)
+        return integral * decimal_step
 
-    def _normalize_qty(self, symbol: str, quantity: float) -> float:
+    def _normalize_qty(self, symbol: str, quantity: float | Decimal) -> str:
         rule = self._filter(symbol, "MARKET_LOT_SIZE") or self._filter(symbol, "LOT_SIZE")
-        normalized = self._normalize(quantity, rule.get("stepSize", "0.001"))
-        minimum = float(rule.get("minQty", 0))
-        return normalized if normalized >= minimum else 0.0
+        normalized = self._normalize(quantity, rule.get("stepSize", "0.001"), "floor")
+        minimum = Decimal(str(rule.get("minQty", 0)))
+        return self._decimal_string(normalized) if normalized >= minimum else "0"
 
-    def _normalize_price(self, symbol: str, price: float) -> float:
-        return self._normalize(price, self._filter(symbol, "PRICE_FILTER").get("tickSize", "0.01"))
+    def _normalize_price(self, symbol: str, price: float | Decimal, rounding: str = "floor") -> str:
+        normalized = self._normalize(price, self._filter(symbol, "PRICE_FILTER").get("tickSize", "0.01"), rounding)
+        return self._decimal_string(normalized)
+
+    def validate_order_notional(self, symbol: str, quantity: float | Decimal, price: float | Decimal) -> str | None:
+        rule = self._filter(symbol, "MIN_NOTIONAL") or self._filter(symbol, "NOTIONAL")
+        minimum = Decimal(str(rule.get("notional", rule.get("minNotional", "0"))))
+        if minimum <= 0:
+            return None
+        notional = Decimal(str(quantity)) * Decimal(str(price))
+        if notional < minimum:
+            return f"Order notional {self._decimal_string(notional)} is below exchange minimum notional {self._decimal_string(minimum)}"
+        return None
+
+    def normalize_protection_prices(self, symbol: str, side: str, stop_price: float, take_profit_price: float) -> tuple[str, str]:
+        sl_rounding = "floor" if side == "LONG" else "ceil"
+        tp_rounding = "ceil" if side == "LONG" else "floor"
+        return (
+            self._normalize_price(symbol, stop_price, sl_rounding),
+            self._normalize_price(symbol, take_profit_price, tp_rounding),
+        )
