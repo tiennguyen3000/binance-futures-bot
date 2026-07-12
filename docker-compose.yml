@@ -5,17 +5,15 @@ services:
     build: .
     container_name: binance-futures-bot
     restart: unless-stopped
-    ports:
-      - "8765:8765"
+    # No host port is published. API binds to container loopback by default.
+    # Put an authenticated reverse proxy/VPN in front only if remote control is required.
     volumes:
-      # Mount .env và .env.live từ host (không build vào image)
       - ./.env:/app/.env:ro
       - ./.env.live:/app/.env.live:ro
-      # Persist state file (mode TESTNET/LIVE)
       - ./.bot_state:/app/.bot_state
-      # Logs
       - ./logs:/app/logs
     environment:
-      - TZ=Asia/Ho_Chi_Minh
-    # Khởi động với mode mặc định từ .bot_state
+      TZ: Asia/Ho_Chi_Minh
+      API_HOST: 127.0.0.1
+      ENABLE_API_MUTATIONS: 'false'
     command: ["python", "main.py", "--verbose"]

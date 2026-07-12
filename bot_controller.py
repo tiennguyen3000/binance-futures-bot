@@ -80,7 +80,7 @@ def set_fetchers(positions_fn, balance_fn):
 @dataclass
 class BotConfig:
     """Trạng thái có thể thay đổi động của bot."""
-    trading_enabled: bool = True
+    trading_enabled: bool = os.getenv("TRADING_ENABLED", "false").strip().lower() in {"1", "true", "yes", "on"}
     top_n: int = 30
     mode: str = "TESTNET"
     restart_needed: bool = False

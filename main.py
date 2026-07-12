@@ -39,6 +39,7 @@ else:
     print(f"[Startup] {env_file} not found, using .env (mode={saved_mode})")
 
 from api_client import BinanceFuturesClient
+from settings import BotSettings
 from state_manager import StateManager, BotState, Position
 from scanner import SmartScanner as SignalScanner, klines_to_df, atr
 from executor import OrderExecutor
@@ -128,59 +129,23 @@ class GracefulKiller:
 
 
 def _monitor_sl_tp(client: BinanceFuturesClient, state_mgr: StateManager, executor: OrderExecutor, stop_event: threading.Event):
-    """
-    Thread riêng kiểm tra SL/TP mỗi 5 giây (Freqtrade pattern).
-    Không block main loop, phản hồi nhanh khi chạm SL/TP.
+    """Watchdog only: Binance conditional orders are the exit source of truth.
+
+    This thread never submits a second discretionary close based on a local
+    ticker. It detects exchange-side exits and lets the main reconciliation
+    report them with fill/income data in a future accounting implementation.
     """
     logger = logging.getLogger(__name__)
-    logger.info("SL/TP monitor thread started (interval=5s)")
-
+    logger.info("Exchange protection watchdog started (interval=5s)")
     while not stop_event.is_set():
         try:
-            for pos in list(state_mgr.get_positions()):
-                try:
-                    price = client.get_symbol_price(pos.symbol)
-                    if price <= 0:
-                        continue
-
-                    triggered = False
-                    reason = ""
-
-                    if pos.side == "LONG":
-                        if pos.sl_price > 0 and price <= pos.sl_price:
-                            triggered = True
-                            reason = "sl"
-                            logger.warning(f"🔴 SL TRIGGERED {pos.symbol}: {price:.2f} <= {pos.sl_price:.2f}")
-                        elif pos.tp_price > 0 and price >= pos.tp_price:
-                            triggered = True
-                            reason = "tp"
-                            logger.info(f"🟢 TP TRIGGERED {pos.symbol}: {price:.2f} >= {pos.tp_price:.2f}")
-                    else:  # SHORT
-                        if pos.sl_price > 0 and price >= pos.sl_price:
-                            triggered = True
-                            reason = "sl"
-                            logger.warning(f"🔴 SL TRIGGERED {pos.symbol}: {price:.2f} >= {pos.sl_price:.2f}")
-                        elif pos.tp_price > 0 and price <= pos.tp_price:
-                            triggered = True
-                            reason = "tp"
-                            logger.info(f"🟢 TP TRIGGERED {pos.symbol}: {price:.2f} <= {pos.tp_price:.2f}")
-
-                    if triggered:
-                        result = executor.close_position(pos.symbol)
-                        if result.get("status") == "success":
-                            logger.info(f"Closed {pos.symbol} via {reason}: PnL={result.get('pnl',0):+.2f}")
-                        else:
-                            logger.warning(f"Failed to close {pos.symbol} on {reason}: {result}")
-
-                except Exception as e:
-                    logger.debug(f"SL/TP check error for {pos.symbol}: {e}")
-
-        except Exception as e:
-            logger.warning(f"SL/TP monitor error: {e}")
-
-        stop_event.wait(5)  # Check mỗi 5 giây
-
-    logger.info("SL/TP monitor thread stopped")
+            for pos in state_mgr.get_positions():
+                if abs(client.get_position_amt(pos.symbol)) < 1e-8:
+                    logger.info("Exchange reports %s closed; awaiting reconciliation", pos.symbol)
+        except Exception as exc:
+            logger.warning("Exchange protection watchdog error: %s", exc)
+        stop_event.wait(5)
+    logger.info("Exchange protection watchdog stopped")
 
 
 def start_sltp_monitor(client: BinanceFuturesClient, state_mgr: StateManager, executor: OrderExecutor) -> threading.Event:
@@ -232,53 +197,65 @@ def check_and_sync_positions(client: BinanceFuturesClient, state_mgr: StateManag
             logger.warning(f"Failed to check position {pos.symbol}: {e}")
 
 
-def sync_exchange_positions(client: BinanceFuturesClient, state_mgr: StateManager):
-    """
-    Import ANY open position từ exchange vào StateManager.
-    (Xử lý trường hợp restart bot khi còn position trên sàn)
-    Tính SL/TP dựa trên ATR nếu chưa có.
+def reconcile_exchange_positions(client: BinanceFuturesClient, state_mgr: StateManager) -> dict:
+    """Classify every exchange position before new entries are allowed.
+
+    A position without a matching exchange-native stop is never silently
+    imported: the bot enters SAFE_HALT and requires operator remediation.
     """
     logger = logging.getLogger(__name__)
-    try:
-        account = client.get_account_info()
-        for p in account.get("positions", []):
-            amt = float(p.get("positionAmt", 0))
-            if abs(amt) < 0.0001:
-                continue
-            symbol = p.get("symbol", "")
-            if state_mgr.has_position(symbol):
-                continue
-            side = "LONG" if amt > 0 else "SHORT"
-            entry = float(p.get("entryPrice", 0))
-            
-            # Tính TP từ ATR (isolated margin → exchange tự liquidate SL)
-            sl_price = 0.0
-            tp_price = 0.0
-            try:
-                klines = client.get_klines(symbol, "15m", 100)
-                if klines and len(klines) >= 50:
-                    df = klines_to_df(klines)
-                    c_atr = float(atr(df, 14).iloc[-1])
-                    if c_atr > 0:
-                        if side == "LONG":
-                            tp_price = round(entry + c_atr * 2.5, max(6, len(str(c_atr).split('.')[1] if '.' in str(c_atr) else 2)))
-                        else:
-                            tp_price = round(entry - c_atr * 2.5, max(6, len(str(c_atr).split('.')[1] if '.' in str(c_atr) else 2)))
-                        logger.info(f"  Calculated TP={tp_price} (ATR={c_atr:.6f}, isolated, no SL needed)")
-            except Exception as e:
-                logger.debug(f"  Could not calculate TP: {e}")
-
-            logger.info(f"Synced position from exchange: {side} {symbol} {abs(amt):.0f} @ {entry}")
-            state_mgr.add_position(Position(
-                symbol=symbol,
-                side=side,
-                entry_price=entry,
-                quantity=abs(amt),
-                sl_price=sl_price,
-                tp_price=tp_price,
-            ))
-    except Exception as e:
-        logger.warning(f"Failed to sync exchange positions: {e}")
+    unprotected: list[str] = []
+    imported: list[str] = []
+    account = client.get_account_info()
+    if account.get("_error"):
+        reason = f"Cannot reconcile account: {account}"
+        state_mgr.safe_halt(reason)
+        logger.critical(reason)
+        return {"ready": False, "unprotected": ["ACCOUNT_READ_FAILED"], "imported": []}
+    for raw in account.get("positions", []):
+        amount = float(raw.get("positionAmt", 0))
+        if abs(amount) < 1e-8:
+            continue
+        if raw.get("positionSide") in {"LONG", "SHORT"}:
+            reason = f"Hedge-mode exposure is unsupported: {raw.get('symbol')} {raw.get('positionSide')}"
+            state_mgr.safe_halt(reason)
+            logger.critical(reason)
+            return {"ready": False, "unprotected": [raw.get("symbol", "UNKNOWN")], "imported": imported}
+        symbol = raw.get("symbol", "")
+        side = "LONG" if amount > 0 else "SHORT"
+        close_side = "SELL" if side == "LONG" else "BUY"
+        orders = client.get_open_orders(symbol)
+        if not isinstance(orders, list):
+            unprotected.append(symbol)
+            logger.critical("Cannot read orders for %s; treating exposure as unsafe", symbol)
+            continue
+        stop = next((order for order in orders if order.get("type") == "STOP_MARKET" and order.get("side") == close_side), None)
+        take_profit = next((order for order in orders if order.get("type") == "TAKE_PROFIT_MARKET" and order.get("side") == close_side), None)
+        if not stop:
+            unprotected.append(symbol)
+            continue
+        if state_mgr.has_position(symbol):
+            continue
+        added = state_mgr.add_position(Position(
+            symbol=symbol,
+            side=side,
+            entry_price=float(raw.get("entryPrice", 0)),
+            quantity=abs(amount),
+            sl_price=float(stop.get("stopPrice", 0)),
+            tp_price=float(take_profit.get("stopPrice", 0)) if take_profit else 0.0,
+            order_id_sl=str(stop.get("orderId") or stop.get("clientAlgoId") or "") or None,
+            order_id_tp=str(take_profit.get("orderId") or take_profit.get("clientAlgoId") or "") if take_profit else None,
+        ))
+        if added:
+            imported.append(symbol)
+        else:
+            unprotected.append(symbol)
+    if unprotected:
+        state_mgr.safe_halt("Unprotected or untracked exchange exposure: " + ", ".join(unprotected))
+        logger.critical("Reconciliation failed; new entries disabled: %s", unprotected)
+        return {"ready": False, "unprotected": unprotected, "imported": imported}
+    logger.info("Exchange reconciliation complete; protected positions=%s", imported)
+    return {"ready": True, "unprotected": [], "imported": imported}
 
 
 # ---- Main Loop ----
@@ -304,6 +281,11 @@ def run_bot(testnet: bool = True, use_deepseek: bool = False):
         leverage=LEVERAGE,
     ))
 
+    # Runtime settings are the source of truth; legacy constants remain only as CLI defaults.
+    runtime_settings = BotSettings.from_env()
+    bot_cfg.trading_enabled = runtime_settings.trading_enabled
+    bot_cfg.max_positions = runtime_settings.max_positions
+
     # Initialize components
     client = BinanceFuturesClient(testnet=testnet)
     state_mgr = StateManager(max_positions=bot_cfg.max_positions)
@@ -311,8 +293,9 @@ def run_bot(testnet: bool = True, use_deepseek: bool = False):
         client=client,
         state_mgr=state_mgr,
         capital_usdt=CAPITAL_USDT,
-        risk_per_trade=RISK_PER_TRADE,
-        leverage=LEVERAGE,
+        risk_per_trade=runtime_settings.risk_per_trade,
+        leverage=runtime_settings.leverage,
+        max_position_notional_pct=runtime_settings.max_position_notional_pct,
     )
     scanner = SignalScanner(
         client=client,
@@ -322,8 +305,25 @@ def run_bot(testnet: bool = True, use_deepseek: bool = False):
         max_funding_rate_pct=bot_cfg.max_funding_rate_pct,
     )
 
-    # Sync positions từ exchange (quan trọng khi restart bot)
-    sync_exchange_positions(client, state_mgr)
+    try:
+        client.assert_one_way_mode()
+    except Exception as exc:
+        state_mgr.safe_halt(f"Cannot verify One-way position mode: {exc}")
+        raise RuntimeError("Startup aborted: Binance account must use One-way Mode") from exc
+
+    # Synchronize before signed requests and refuse to proceed if Binance time cannot be read.
+    try:
+        client.sync_time()
+    except Exception as exc:
+        state_mgr.safe_halt(f"Cannot synchronize Binance server time: {exc}")
+        raise RuntimeError("Startup aborted: Binance time synchronization failed") from exc
+
+    # Reconcile first; never start entries while exchange exposure is unknown.
+    reconciliation = reconcile_exchange_positions(client, state_mgr)
+    if not reconciliation["ready"]:
+        send_tg("🚨 SAFE_HALT: unprotected exchange positions detected; entries disabled.")
+
+    # Legacy sync is intentionally not used: it inferred ATR targets and left stops unset.
 
     # Khởi động Telegram command listener (polling thread)
     tg_stop = start_polling()
@@ -335,7 +335,7 @@ def run_bot(testnet: bool = True, use_deepseek: bool = False):
         balance_fn=lambda: client.get_balance("USDT"),
         executor=executor,
     )
-    api_thread = start_api_thread(host="0.0.0.0", port=8765)
+    api_thread = start_api_thread(host=os.getenv("API_HOST", "127.0.0.1"), port=int(os.getenv("API_PORT", "8765")))
 
     # Inject callbacks cho Telegram commands (real-time data)
     tg_set_fetchers(
@@ -473,7 +473,8 @@ def run_bot(testnet: bool = True, use_deepseek: bool = False):
                 break
             time.sleep(1)
 
-    # Graceful shutdown
+    tg_stop.set()
+    sltp_stop.set()
     logger.info("Bot shutting down...")
     positions = state_mgr.get_positions()
     
