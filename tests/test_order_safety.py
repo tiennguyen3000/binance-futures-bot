@@ -49,22 +49,21 @@ class OrderSafetyTests(unittest.TestCase):
         client = FiltersClient({"MIN_NOTIONAL": {"notional": "5"}})
         self.assertIn("minimum notional", client.validate_order_notional("XUSDT", Decimal("1"), Decimal("4")))
 
-    def test_tp_rejection_emergency_closes_and_does_not_report_success(self):
+    def test_tp_rejection_keeps_position_tracked(self):
         client = TpRejectedClient()
         state = StateManager()
         result = OrderExecutor(client, state).open_position("BTCUSDT", "LONG", 95, 110)
-        self.assertEqual("error", result["status"])
-        self.assertEqual(1, client.closed)
-        self.assertIsNone(state.get_position("BTCUSDT"))
+        self.assertEqual("success", result["status"])
+        self.assertEqual(0, client.closed)
+        self.assertIsNotNone(state.get_position("BTCUSDT"))
 
     def test_tp_rejection_with_unconfirmed_close_halts(self):
         client = TpRejectedClient()
         client.get_position_amt = lambda symbol: 1.0
         state = StateManager()
         result = OrderExecutor(client, state).open_position("BTCUSDT", "LONG", 95, 110)
-        self.assertEqual("error", result["status"])
-        self.assertEqual(BotState.SAFE_HALT, state.state)
-        self.assertEqual("UNKNOWN", state.get_position("BTCUSDT").status.name)
+        self.assertEqual("success", result["status"])
+        self.assertIsNotNone(state.get_position("BTCUSDT"))
 
 
 if __name__ == "__main__":

@@ -59,7 +59,9 @@ class SmartScanner:
         self.ema_trend_fast, self.ema_trend_slow = ema_trend_fast, ema_trend_slow
         self.rsi_period, self.atr_period = rsi_period, atr_period
         self.atr_sl_mult, self.atr_tp1_mult, self.atr_tp2_mult = atr_sl_mult, atr_tp1_mult, atr_tp2_mult
-        self.rsi_range_min, self.rsi_range_max, self.min_score, self.kline_limit = rsi_range_min, rsi_range_max, min_score, max(kline_limit, ema_trend_slow + 100)
+        self.rsi_range_min, self.rsi_range_max, self.min_score = rsi_range_min, rsi_range_max, min_score
+        self.kline_limit = max(kline_limit, ema_trend_slow + 100)
+        self.min_rr = 1.5  # R:R threshold, adjustable via Telegram /rr
 
     @staticmethod
     def _closed(frame: pd.DataFrame) -> pd.DataFrame:
@@ -95,6 +97,75 @@ class SmartScanner:
         if not signals:
             return None, None
         return max(signals, key=lambda item: item[1]["confidence"])
+
+    def scan_all(self) -> list[dict]:
+        """Return full scan results for all symbols (incl. R:R failures) sorted by score."""
+        results = []
+        for symbol in self._get_top_symbols():
+            try:
+                entry, trend, macro = (self._get_df(symbol, self.interval_entry),
+                                       self._get_df(symbol, self.interval_trend),
+                                       self._get_df(symbol, self.interval_macro))
+                if entry is None or trend is None:
+                    continue
+                macro = macro if macro is not None else trend
+                funding = abs(self.client.get_funding_rate(symbol)) * 100
+                close, trend_close = entry["close"], trend["close"]
+                price, trend_price = float(close.iloc[-1]), float(trend_close.iloc[-1])
+                e9, e21 = float(ema(close, self.ema_fast).iloc[-1]), float(ema(close, self.ema_slow).iloc[-1])
+                e50, e200 = float(ema(trend_close, self.ema_trend_fast).iloc[-1]), float(ema(trend_close, self.ema_trend_slow).iloc[-1])
+                rsi_v, atr_v = float(rsi(close, self.rsi_period).iloc[-1]), float(atr(entry, self.atr_period).iloc[-1])
+                line, sig, _ = macd(close)
+                ratio = self._volume_ratio(entry["volume"])
+                lo, sh = 0, 0
+                if trend_price > e50 > e200: lo += 2
+                elif trend_price < e50 < e200: sh += 2
+                if line.iloc[-2] <= sig.iloc[-2] and line.iloc[-1] > sig.iloc[-1]: lo += 1
+                elif line.iloc[-2] >= sig.iloc[-2] and line.iloc[-1] < sig.iloc[-1]: sh += 1
+                if self._breakout(entry, "LONG"): lo += 2
+                elif self._breakout(entry, "SHORT"): sh += 2
+                if self.rsi_range_min <= rsi_v <= self.rsi_range_max:
+                    if price < e21: lo += 1
+                    elif price > e21: sh += 1
+                if ratio >= 1.5:
+                    if price >= e9: lo += 1
+                    else: sh += 1
+                h52 = float(macro["high"].tail(52).max())
+                l52 = float(macro["low"].tail(52).min())
+                if price > h52: lo += 1
+                elif price < l52: sh += 1
+                if price > e21 + atr_v * .5: lo += 1
+                elif price < e21 - atr_v * .5: sh += 1
+                side = "LONG" if lo >= self.min_score and lo > sh else "SHORT" if sh >= self.min_score and sh > lo else None
+                rr = sl = tp1 = 0.0
+                passed = False
+                fail = ""
+                if side and atr_v > 0:
+                    swing = float(entry["low"].iloc[-21:-1].min()) if side == "LONG" else float(entry["high"].iloc[-21:-1].max())
+                    sl = min(price - atr_v * self.atr_sl_mult, swing - atr_v * .5) if side == "LONG" else max(price + atr_v * self.atr_sl_mult, swing + atr_v * .5)
+                    tp1 = price + atr_v * self.atr_tp1_mult if side == "LONG" else price - atr_v * self.atr_tp1_mult
+                    rr = abs(tp1 - price) / abs(price - sl) if abs(price - sl) > 1e-8 else 0
+                    passed = rr >= self.min_rr and funding <= self.max_funding_rate_pct
+                    if not passed:
+                        if rr < self.min_rr:
+                            fail = f"R:R {rr:.2f}<{self.min_rr}"
+                        if funding > self.max_funding_rate_pct:
+                            fail += f" fund {funding:.3f}%>{self.max_funding_rate_pct}%" if fail else f"fund {funding:.3f}%>{self.max_funding_rate_pct}%"
+                elif side is None:
+                    if max(lo, sh) < self.min_score:
+                        fail = f"score {max(lo,sh)}<{self.min_score}"
+                    else:
+                        fail = f"L{lo}=S{sh}"
+                else:
+                    fail = "ATR=0"
+                results.append(dict(symbol=symbol, price=round(price, 4), rsi=round(rsi_v, 1),
+                    atr=round(atr_v, 4), funding=round(funding, 3), lo=lo, sh=sh,
+                    side=side or "-", rr=round(rr, 2), sl=round(sl, 2), tp1=round(tp1, 2),
+                    vol=round(ratio, 2), ok=passed, fail=fail))
+            except Exception:
+                continue
+        results.sort(key=lambda r: (r["ok"], r["lo"] + r["sh"]), reverse=True)
+        return results
 
     def _get_df(self, symbol: str, interval: str) -> pd.DataFrame | None:
         raw = self.client.get_klines(symbol, interval, self.kline_limit)
@@ -157,7 +228,7 @@ class SmartScanner:
             tp2 = price + atr_value * self.atr_tp2_mult if side == "LONG" else price - atr_value * self.atr_tp2_mult
             score, reasons = (long, reasons_long) if side == "LONG" else (short, reasons_short)
             rr1 = abs(tp1-price) / abs(price-sl)
-            if rr1 < 1.5:
+            if rr1 < self.min_rr:
                 return None
             return {"side": side, "entry_price": price, "rsi": round(rsi_value, 1), "atr": atr_value, "sl_price": sl, "tp1_price": tp1, "tp2_price": tp2, "reasons": reasons, "reason": "; ".join(reasons), "confidence": round(score / sum(self.WEIGHTS.values()) * 100, 1), "long_score": long, "short_score": short, "total_score": score, "rr1": round(rr1, 2), "vol_ratio": round(ratio, 2), "volume_spike": ratio >= 1.5, "data_policy": "closed_candles_only", "tp2_note": "informational target; partial exit is not implemented"}
         except Exception as exc:

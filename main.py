@@ -47,7 +47,7 @@ from telegram_notifier import (
     send_message, signal_msg, entry_msg, exit_msg,
     status_msg, error_msg, bot_start_msg, bot_stop_msg,
 )
-from bot_controller import config as bot_cfg, start_polling, send_tg, set_fetchers as tg_set_fetchers
+from bot_controller import config as bot_cfg, start_polling, send_tg, set_fetchers as tg_set_fetchers, set_scanlist_fetcher, set_resume_fetcher
 from api_server import start_api_thread, set_fetchers
 
 # ---- Configuration ----
@@ -129,23 +129,48 @@ class GracefulKiller:
 
 
 def _monitor_sl_tp(client: BinanceFuturesClient, state_mgr: StateManager, executor: OrderExecutor, stop_event: threading.Event):
-    """Watchdog only: Binance conditional orders are the exit source of truth.
+    """Watch SL/TP levels every 5s and close positions when triggered.
 
-    This thread never submits a second discretionary close based on a local
-    ticker. It detects exchange-side exits and lets the main reconciliation
-    report them with fill/income data in a future accounting implementation.
+    Acts as a safety net when exchange STOP_MARKET/TAKE_PROFIT_MARKET orders
+    are unavailable (e.g. testnet). Uses current mark price — not best for
+    latency-critical exits but prevents unlimited drift.
     """
     logger = logging.getLogger(__name__)
-    logger.info("Exchange protection watchdog started (interval=5s)")
+    logger.info("SL/TP price monitor started (interval=5s)")
     while not stop_event.is_set():
         try:
             for pos in state_mgr.get_positions():
-                if abs(client.get_position_amt(pos.symbol)) < 1e-8:
+                # Check exchange-side close (SL/TP hit via Binance)
+                try:
+                    amt = client.get_position_amt(pos.symbol)
+                except Exception:
+                    continue
+                if abs(amt) < 1e-8:
                     logger.info("Exchange reports %s closed; awaiting reconciliation", pos.symbol)
+                    continue
+                # In-process SL/TP check (fallback when exchange orders unavailable)
+                if pos.sl_price <= 0 and pos.tp_price <= 0:
+                    continue  # no local SL/TP targets
+                mark = client.get_symbol_price(pos.symbol)
+                if mark <= 0:
+                    continue
+                triggered = False
+                if pos.sl_price > 0:
+                    if (pos.side == "LONG" and mark <= pos.sl_price) or \
+                       (pos.side == "SHORT" and mark >= pos.sl_price):
+                        logger.warning("SL TRIGGERED: %s %s at %.4f (SL=%.4f)", pos.side, pos.symbol, mark, pos.sl_price)
+                        triggered = True
+                if not triggered and pos.tp_price > 0:
+                    if (pos.side == "LONG" and mark >= pos.tp_price) or \
+                       (pos.side == "SHORT" and mark <= pos.tp_price):
+                        logger.warning("TP TRIGGERED: %s %s at %.4f (TP=%.4f)", pos.side, pos.symbol, mark, pos.tp_price)
+                        triggered = True
+                if triggered:
+                    executor.close_position(pos.symbol)
         except Exception as exc:
-            logger.warning("Exchange protection watchdog error: %s", exc)
+            logger.warning("SL/TP monitor error: %s", exc)
         stop_event.wait(5)
-    logger.info("Exchange protection watchdog stopped")
+    logger.info("SL/TP price monitor stopped")
 
 
 def start_sltp_monitor(client: BinanceFuturesClient, state_mgr: StateManager, executor: OrderExecutor) -> threading.Event:
@@ -229,11 +254,26 @@ def reconcile_exchange_positions(client: BinanceFuturesClient, state_mgr: StateM
         if not isinstance(orders, list):
             unprotected.append(symbol)
             logger.critical("Cannot read orders for %s; treating exposure as unsafe", symbol)
+            state_mgr.record_unknown_exposure(Position(
+                symbol=symbol, side=side,
+                entry_price=float(raw.get("entryPrice", 0)),
+                quantity=abs(amount), sl_price=0.0, tp_price=0.0,
+            ), f"Cannot read orders for {symbol}; treated as unsafe")
             continue
         stop = next((order for order in orders if order.get("type") == "STOP_MARKET" and order.get("side") == close_side), None)
         take_profit = next((order for order in orders if order.get("type") == "TAKE_PROFIT_MARKET" and order.get("side") == close_side), None)
         if not stop:
             unprotected.append(symbol)
+            # Still track the position so /position shows it; mark as UNKNOWN + SAFE_HALT
+            state_mgr.record_unknown_exposure(Position(
+                symbol=symbol,
+                side=side,
+                entry_price=float(raw.get("entryPrice", 0)),
+                quantity=abs(amount),
+                sl_price=0.0,
+                tp_price=0.0,
+                order_id_entry=None,
+            ), f"No STOP_MARKET found for unprotected {symbol}")
             continue
         if state_mgr.has_position(symbol):
             continue
@@ -304,8 +344,25 @@ def run_bot(testnet: bool = True, use_deepseek: bool = False):
         interval_trend="1h",
         max_funding_rate_pct=bot_cfg.max_funding_rate_pct,
     )
+    scanner.min_rr = bot_cfg.min_rr
+    # Wrap scan_all to sync min_rr from config before each Telegram /scanlist call
+    def _scanlist():
+        scanner.min_rr = bot_cfg.min_rr
+        return scanner.scan_all()
+    set_scanlist_fetcher(_scanlist)
+    # Inject resume callback (force-clear SAFE_HALT from Telegram)
+    _resume_injected = False
+    def _resume():
+        nonlocal _resume_injected
+        if state_mgr.state == BotState.SAFE_HALT:
+            state_mgr.set_state(BotState.IDLE)
+            _resume_injected = True
+            logger.warning("Bot force-resumed from SAFE_HALT via Telegram")
+            return True
+        return False
+    set_resume_fetcher(_resume)
 
-    # Synchronize before every signed startup request, including position-mode detection.
+     # Synchronize
     try:
         client.sync_time()
     except Exception as exc:
@@ -390,83 +447,68 @@ def run_bot(testnet: bool = True, use_deepseek: bool = False):
                 scanner.max_funding_rate_pct = bot_cfg.max_funding_rate_pct
                 logger.info(f"Funding rate filter updated to {bot_cfg.max_funding_rate_pct}% via Telegram")
 
+            # Cập nhật động R:R threshold
+            if scanner.min_rr != bot_cfg.min_rr:
+                scanner.min_rr = bot_cfg.min_rr
+                logger.info(f"R:R threshold updated to {bot_cfg.min_rr} via Telegram")
+
             # Kiểm tra restart_needed (khi đổi testnet/live)
             if bot_cfg.restart_needed:
                 logger.warning("Restart needed for mode change. Shutting down...")
                 send_tg("🔄 Cần restart để đổi mode. Đang tắt bot...")
                 break
 
-            # 3. Scan for signals if we have room
-            if state_mgr.can_open():
+            # 3. Scan for signals — keep opening while capacity and signals exist
+            while state_mgr.can_open():
 
-                # Kiểm tra trading_enabled từ Telegram command
                 if not bot_cfg.trading_enabled:
                     logger.info("Trading is DISABLED via Telegram. Skipping entry.")
-                    time.sleep(runtime_settings.scan_interval_seconds)
-                    continue
+                    break
 
                 state_mgr.set_state(BotState.SCANNING)
 
-                # Sizing and exchange filters decide feasibility per symbol; a fixed
-                # account-wide balance threshold would incorrectly reject low-notional contracts.
                 balance = client.get_balance("USDT")
                 logger.info(f"USDT Balance: {balance:.2f}")
                 if balance <= 0:
                     logger.warning("No available USDT balance; skipping scan")
-                    time.sleep(runtime_settings.scan_interval_seconds)
-                    continue
+                    break
 
                 symbol, signal = scanner.scan(eligible=lambda candidate, candidate_signal: executor.can_execute_signal(
-                    candidate,
-                    candidate_signal["side"],
-                    candidate_signal["entry_price"],
-                    candidate_signal["sl_price"],
-                    candidate_signal["tp1_price"],
+                    candidate, candidate_signal["side"], candidate_signal["entry_price"],
+                    candidate_signal["sl_price"], candidate_signal["tp1_price"],
                 ))
 
-                if symbol and signal:
-                    # Optional DeepSeek filter
-                    if deepseek_filter:
-                        logger.info(f"Checking signal with DeepSeek AI...")
-                        verdict = deepseek_filter(
-                            symbol, signal, signal["entry_price"], signal["rsi"]
-                        )
-                        logger.info(f"DeepSeek verdict: {verdict}")
-                        if verdict and verdict.lower().startswith("no"):
-                            logger.info(f"DeepSeek rejected signal for {symbol}, skipping")
-                            time.sleep(runtime_settings.scan_interval_seconds)
-                            continue
+                if not symbol or not signal:
+                    logger.info("No more signals found this cycle")
+                    break
 
-                    # Execute trade with ATR-based SL/TP from scanner
-                    state_mgr.set_state(BotState.ENTERING)
-                    result = executor.open_position(
-                        symbol, signal["side"],
-                        sl_price=signal.get("sl_price"),
-                        tp1_price=signal.get("tp1_price"),
-                        tp2_price=signal.get("tp2_price"),
+                if deepseek_filter:
+                    logger.info(f"Checking signal with DeepSeek AI...")
+                    verdict = deepseek_filter(symbol, signal, signal["entry_price"], signal["rsi"])
+                    logger.info(f"DeepSeek verdict: {verdict}")
+                    if verdict and verdict.lower().startswith("no"):
+                        logger.info(f"DeepSeek rejected {symbol}, trying next signal...")
+                        continue
+
+                state_mgr.set_state(BotState.ENTERING)
+                result = executor.open_position(
+                    symbol, signal["side"],
+                    sl_price=signal.get("sl_price"),
+                    tp1_price=signal.get("tp1_price"),
+                    tp2_price=signal.get("tp2_price"),
+                )
+                logger.info(f"Trade result: {result}")
+
+                if result.get("status") == "success":
+                    logger.info(
+                        f">>> ENTERED {signal['side']} {symbol} @ {result['entry_price']:.2f} "
+                        f"| Qty={result['quantity']:.4f} "
+                        f"| SL={result['sl_price']:.2f} "
+                        f"TP1={result['tp1_price']:.2f} TP2={result['tp2_price']:.2f}"
                     )
-                    logger.info(f"Trade result: {result}")
-
-                    if result.get("status") == "success":
-                        logger.info(
-                            f">>> ENTERED {signal['side']} {symbol} @ {result['entry_price']:.2f} "
-                            f"| Qty={result['quantity']:.4f} "
-                            f"| SL={result['sl_price']:.2f} "
-                            f"TP1={result['tp1_price']:.2f} TP2={result['tp2_price']:.2f}"
-                        )
-                        # Telegram: tín hiệu + vào lệnh
-                        send_message(signal_msg(
-                            symbol, signal["side"], signal["entry_price"], signal["rsi"],
-                            signal.get("confidence"),
-                        ))
-                        send_message(entry_msg(
-                            symbol, signal["side"],
-                            result["entry_price"], result["quantity"],
-                            result["sl_price"], result["tp1_price"],
-                            balance, result.get("tp2_price"),
-                        ))
-                else:
-                    logger.info("No signal found this cycle")
+                    send_message(signal_msg(symbol, signal["side"], signal["entry_price"], signal["rsi"], signal.get("confidence")))
+                    send_message(entry_msg(symbol, signal["side"], result["entry_price"], result["quantity"],
+                        result["sl_price"], result["tp1_price"], balance, result.get("tp2_price")))
             else:
                 logger.info("Max positions reached — scanning paused")
 

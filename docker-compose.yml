@@ -1,12 +1,11 @@
-version: '3.8'
-
 services:
   bot:
     build: .
     container_name: binance-futures-bot
     restart: unless-stopped
-    # No host port is published. API binds to container loopback by default.
-    # Put an authenticated reverse proxy/VPN in front only if remote control is required.
+    # Expose REST API for host access
+    ports:
+      - "8765:8765"
     volumes:
       - ./.env:/app/.env:ro
       - ./.env.live:/app/.env.live:ro
@@ -14,6 +13,6 @@ services:
       - ./logs:/app/logs
     environment:
       TZ: Asia/Ho_Chi_Minh
-      API_HOST: 127.0.0.1
+      API_HOST: 0.0.0.0
       ENABLE_API_MUTATIONS: 'false'
     command: ["python", "main.py", "--verbose"]

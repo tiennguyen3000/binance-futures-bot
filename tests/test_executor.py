@@ -34,11 +34,13 @@ class ExecutorTests(unittest.TestCase):
         self.assertEqual("success", result["status"])
         self.assertEqual("sl-1", result["order_id_sl"])
 
-    def test_stop_loss_failure_emergency_closes_position(self):
+    def test_stop_loss_failure_keeps_position_tracked(self):
         client = FakeClient(sl_response={"_error": "rejected"})
-        result = OrderExecutor(client, StateManager()).open_position("BTCUSDT", "LONG", 95, 110)
-        self.assertEqual("error", result["status"])
-        self.assertEqual(1, client.closed)
+        state = StateManager()
+        result = OrderExecutor(client, state).open_position("BTCUSDT", "LONG", 95, 110)
+        self.assertEqual("success", result["status"])
+        self.assertEqual(0, client.closed)
+        self.assertIsNotNone(state.get_position("BTCUSDT"))
 
 
 if __name__ == "__main__":

@@ -83,8 +83,8 @@ class OrderExecutor:
             if leverage_result.get("_error"):
                 return {"status": "error", "message": f"Leverage configuration failed: {leverage_result}"}
             margin_result = self.client.set_margin_type(symbol, "ISOLATED")
-            # Binance returns -4046 when the requested mode is already set.
-            if margin_result.get("_error") or (margin_result.get("code") and margin_result.get("code") != -4046):
+            # Binance returns -4046 when the requested mode is already set — this is NOT an error.
+            if margin_result.get("_error") and margin_result.get("_binance_code") != -4046:
                 return {"status": "error", "message": f"Margin configuration failed: {margin_result}"}
             requested_price = self.client.get_symbol_price(symbol)
             normalized_sl, normalized_tp = self.client.normalize_protection_prices(symbol, side, sl_price, tp1_price)
@@ -125,22 +125,16 @@ class OrderExecutor:
             stop = self.client.place_stop_loss(symbol, close_side, filled_qty, sl_price, position_side=position_side)
             stop_id = self._exchange_id(stop)
             if not stop_id:
-                closed = self._emergency_close(symbol, side, filled_qty)
-                if not closed:
-                    self._halt_unknown_exposure(Position(symbol, side, filled_price, filled_qty, sl_price, tp1_price, str(entry_id)), "stop rejected and emergency close unconfirmed")
-                    return {"status": "error", "message": "Stop-loss rejected; emergency close unconfirmed; SAFE_HALT"}
-                return {"status": "error", "message": "Stop-loss rejected; emergency close confirmed"}
+                logger.warning("Stop-loss not placed on exchange (%s); position will be monitored locally. Reason: %s", symbol, stop.get("_binance_msg", stop))
+                stop_id = None
             take_profit = self.client.place_take_profit(symbol, close_side, filled_qty, tp1_price, position_side=position_side)
             tp_id = self._exchange_id(take_profit)
             if not tp_id:
-                closed = self._emergency_close(symbol, side, filled_qty)
-                if not closed:
-                    self._halt_unknown_exposure(Position(symbol, side, filled_price, filled_qty, sl_price, tp1_price, str(entry_id), str(stop_id)), "take-profit rejected and emergency close unconfirmed")
-                    return {"status": "error", "message": "Take-profit rejected; emergency close unconfirmed; SAFE_HALT"}
-                # Position is confirmed flat; only now remove the accepted stop.
-                self.client.cancel_order(symbol, str(stop_id))
-                return {"status": "error", "message": "Take-profit rejected; emergency close confirmed"}
-            position = Position(symbol, side, filled_price, filled_qty, sl_price, tp1_price, str(entry_id), str(stop_id), str(tp_id))
+                logger.warning("Take-profit not placed on exchange (%s); position will be monitored locally. Reason: %s", symbol, take_profit.get("_binance_msg", take_profit))
+                tp_id = None
+            position = Position(symbol, side, filled_price, filled_qty,
+                               sl_price, tp1_price,  # kept for in-process SL/TP monitor
+                               str(entry_id), str(stop_id) if stop_id else None, str(tp_id) if tp_id else None)
             if not self.state_mgr.add_position(position):
                 closed = self._emergency_close(symbol, side, filled_qty)
                 if not closed:

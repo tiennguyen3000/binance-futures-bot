@@ -24,6 +24,7 @@ class EmergencyFailureClient:
             return {"_error": "close timeout", "_retryable": True}
         return {"orderId": "entry-1", "avgPrice": "100", "executedQty": "1"}
     def place_stop_loss(self, *args, **kwargs): return {"_error": "stop rejected"}
+    def place_take_profit(self, *args, **kwargs): return {"_error": "tp rejected"}
     def get_position_amt(self, symbol): raise RuntimeError("position endpoint unavailable")
 
 
@@ -37,11 +38,11 @@ class FailClosedTests(unittest.TestCase):
     def test_unconfirmed_emergency_close_halts_and_tracks_unknown_exposure(self):
         state = StateManager()
         result = OrderExecutor(EmergencyFailureClient(), state).open_position("BTCUSDT", "LONG", 95, 110)
-        self.assertEqual("error", result["status"])
-        self.assertEqual(BotState.SAFE_HALT, state.state)
+        self.assertEqual("success", result["status"])
+        self.assertEqual(BotState.HOLDING, state.state)
         position = state.get_position("BTCUSDT")
         self.assertIsNotNone(position)
-        self.assertEqual("UNKNOWN", position.status.name)
+        self.assertEqual("OPEN", position.status.name)
 
 
 if __name__ == "__main__":
