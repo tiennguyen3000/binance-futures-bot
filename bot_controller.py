@@ -68,6 +68,8 @@ def load_saved_mode() -> str:
 # Callbacks để lấy dữ liệu real-time từ Binance (được main.py inject)
 _positions_cb = lambda: []
 _balance_cb = lambda: 0.0
+_scanlist_cb = lambda: []  # scan_all results for /scanlist
+_resume_cb = lambda: False  # force-resume from SAFE_HALT
 
 
 def set_fetchers(positions_fn, balance_fn):
@@ -77,15 +79,28 @@ def set_fetchers(positions_fn, balance_fn):
     _balance_cb = balance_fn
 
 
+def set_scanlist_fetcher(fn):
+    """Gắn callback lấy kết quả scan_all."""
+    global _scanlist_cb
+    _scanlist_cb = fn
+
+
+def set_resume_fetcher(fn):
+    """Gắn callback force-resume từ SAFE_HALT."""
+    global _resume_cb
+    _resume_cb = fn
+
+
 @dataclass
 class BotConfig:
     """Trạng thái có thể thay đổi động của bot."""
-    trading_enabled: bool = True
+    trading_enabled: bool = os.getenv("TRADING_ENABLED", "false").strip().lower() in {"1", "true", "yes", "on"}
     top_n: int = 30
     mode: str = "TESTNET"
     restart_needed: bool = False
     max_positions: int = 1
     max_funding_rate_pct: float = 0.1
+    min_rr: float = 1.5
     positions: list = None
     total_pnl: float = 0.0
     balance_usdt: float = 0.0
@@ -125,7 +140,14 @@ def _handle_command(text: str) -> Optional[str]:
         if config.trading_enabled:
             return "✅ Bot đang BẬT giao dịch rồi."
         config.trading_enabled = True
+        _resume_cb()  # clear SAFE_HALT if set
         return "✅ Đã BẬT giao dịch. Bot sẽ vào lệnh khi có tín hiệu."
+
+    if cmd in ("/resume", "resume"):
+        resumed = _resume_cb()
+        if resumed:
+            return "▶️ Đã force-resume bot. Nếu còn vị thế không được bảo vệ, hãy đóng thủ công trên Binance."
+        return "✅ Bot không trong trạng thái SAFE_HALT, không cần resume."
 
     if cmd in ("/stop", "stop"):
         if not config.trading_enabled:
@@ -155,6 +177,29 @@ def _handle_command(text: str) -> Optional[str]:
         _save_mode("LIVE")
         return "⚠️ Chuyển sang <b>LIVE</b>. Vui lòng RESTART bot để áp dụng."
 
+    if cmd in ("/scanlist", "scanlist"):
+        results = _scanlist_cb()
+        if not results:
+            return "📭 Không có kết quả scan."
+        lines = [f"📋 <b>SCAN RESULTS</b> (R:R ≥ {config.min_rr})",
+                 "Coin        L  S  RSI   ATR    Fund%  R:R  Side  Reason"]
+        ok_count = 0
+        for r in results[:20]:  # top 20
+            mark = "✅" if r["ok"] else "  "
+            fail = r.get("fail", "")
+            # Escape HTML entities — fail strings contain < and > (e.g. R:R 0.46<1.5)
+            fail_esc = fail.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+            fail_disp = f"<b>{fail_esc}</b>" if fail else ""
+            lines.append(
+                f"{mark} {r['symbol']:<8} {r['lo']:>2} {r['sh']:>2} "
+                f"{r['rsi']:>5.1f} {r['atr']:>7.4f} {r['funding']:>5.3f} "
+                f"{r['rr']:>4.2f} {r['side']:>5} {fail_disp}"
+            )
+            if r["ok"]:
+                ok_count += 1
+        lines.append(f"\n✅ Tín hiệu hợp lệ: {ok_count}/{len(results)}")
+        return "\n".join(lines)
+
     if cmd.startswith("/scan") or cmd.startswith("scan"):
         try:
             n = int(parts[1]) if len(parts) > 1 else 30
@@ -178,6 +223,14 @@ def _handle_command(text: str) -> Optional[str]:
             return f"💸 Đã đặt funding rate tối đa = {config.max_funding_rate_pct}%. Dùng 0.05-0.5."
         except (IndexError, ValueError):
             return f"💸 Funding rate tối đa hiện tại: {config.max_funding_rate_pct}%. Dùng: /funding <%%> (0.001-0.5)"
+
+    if cmd.startswith("/rr") or cmd.startswith("rr"):
+        try:
+            n = float(parts[1]) if len(parts) > 1 else config.min_rr
+            config.min_rr = max(0.5, min(5.0, n))
+            return f"📐 Đã đặt R:R threshold = {config.min_rr}. Bot sẽ chỉ vào lệnh khi R:R ≥ {config.min_rr}."
+        except (IndexError, ValueError):
+            return f"📐 R:R threshold hiện tại: {config.min_rr}. Dùng: /rr <số> (0.5-5.0)"
 
     if cmd in ("/status", "status", "/dashboard"):
         mode_emoji = "🧪" if config.mode == "TESTNET" else "🔥"
@@ -238,11 +291,14 @@ def _handle_command(text: str) -> Optional[str]:
             "🤖 <b>HƯỚNG DẪN ĐIỀU KHIỂN BOT</b>\n\n"
             "/start — Bật giao dịch\n"
             "/stop — Tắt giao dịch\n"
+            "/resume — Force-resume từ SAFE_HALT (cảnh báo: rủi ro)\n"
             "/testnet — Chuyển testnet (cần restart)\n"
             "/live — Chuyển live (cần restart)\n"
             "/scan 50 — Đặt số coin quét\n"
             "/maxpos 2 — Đặt số vị thế tối đa (1-5)\n"
             "/funding 0.05 — Lọc funding rate (0.001-0.5%)\n"
+            "/rr 1.0 — Đặt R:R threshold (0.5-5.0)\n"
+            "/scanlist — Xem bảng scan chi tiết\n"
             "/position — Xem vị thế đang mở\n"
             "/pnl — Tổng kết lãi lỗ\n"
             "/status — Dashboard tổng quan\n"

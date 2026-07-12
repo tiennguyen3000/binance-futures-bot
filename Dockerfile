@@ -9,8 +9,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy source code (excluding .env secrets via .dockerignore)
 COPY . .
 
-# Expose REST API
-EXPOSE 8765
+# API stays internal by default; publish only behind an authenticated proxy.
+# EXPOSE intentionally omitted
 
-# Run bot — mặc định testnet, muốn live thì set BINANCE_TESTNET=false hoặc dùng /live
+# Run testnet-safe bot by default
 CMD ["python", "main.py", "--verbose"]

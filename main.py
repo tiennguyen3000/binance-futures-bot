@@ -39,6 +39,7 @@ else:
     print(f"[Startup] {env_file} not found, using .env (mode={saved_mode})")
 
 from api_client import BinanceFuturesClient
+from settings import BotSettings
 from state_manager import StateManager, BotState, Position
 from scanner import SmartScanner as SignalScanner, klines_to_df, atr
 from executor import OrderExecutor
@@ -46,7 +47,7 @@ from telegram_notifier import (
     send_message, signal_msg, entry_msg, exit_msg,
     status_msg, error_msg, bot_start_msg, bot_stop_msg,
 )
-from bot_controller import config as bot_cfg, start_polling, send_tg, set_fetchers as tg_set_fetchers
+from bot_controller import config as bot_cfg, start_polling, send_tg, set_fetchers as tg_set_fetchers, set_scanlist_fetcher, set_resume_fetcher
 from api_server import start_api_thread, set_fetchers
 
 # ---- Configuration ----
@@ -128,59 +129,48 @@ class GracefulKiller:
 
 
 def _monitor_sl_tp(client: BinanceFuturesClient, state_mgr: StateManager, executor: OrderExecutor, stop_event: threading.Event):
-    """
-    Thread riêng kiểm tra SL/TP mỗi 5 giây (Freqtrade pattern).
-    Không block main loop, phản hồi nhanh khi chạm SL/TP.
+    """Watch SL/TP levels every 5s and close positions when triggered.
+
+    Acts as a safety net when exchange STOP_MARKET/TAKE_PROFIT_MARKET orders
+    are unavailable (e.g. testnet). Uses current mark price — not best for
+    latency-critical exits but prevents unlimited drift.
     """
     logger = logging.getLogger(__name__)
-    logger.info("SL/TP monitor thread started (interval=5s)")
-
+    logger.info("SL/TP price monitor started (interval=5s)")
     while not stop_event.is_set():
         try:
-            for pos in list(state_mgr.get_positions()):
+            for pos in state_mgr.get_positions():
+                # Check exchange-side close (SL/TP hit via Binance)
                 try:
-                    price = client.get_symbol_price(pos.symbol)
-                    if price <= 0:
-                        continue
-
-                    triggered = False
-                    reason = ""
-
-                    if pos.side == "LONG":
-                        if pos.sl_price > 0 and price <= pos.sl_price:
-                            triggered = True
-                            reason = "sl"
-                            logger.warning(f"🔴 SL TRIGGERED {pos.symbol}: {price:.2f} <= {pos.sl_price:.2f}")
-                        elif pos.tp_price > 0 and price >= pos.tp_price:
-                            triggered = True
-                            reason = "tp"
-                            logger.info(f"🟢 TP TRIGGERED {pos.symbol}: {price:.2f} >= {pos.tp_price:.2f}")
-                    else:  # SHORT
-                        if pos.sl_price > 0 and price >= pos.sl_price:
-                            triggered = True
-                            reason = "sl"
-                            logger.warning(f"🔴 SL TRIGGERED {pos.symbol}: {price:.2f} >= {pos.sl_price:.2f}")
-                        elif pos.tp_price > 0 and price <= pos.tp_price:
-                            triggered = True
-                            reason = "tp"
-                            logger.info(f"🟢 TP TRIGGERED {pos.symbol}: {price:.2f} <= {pos.tp_price:.2f}")
-
-                    if triggered:
-                        result = executor.close_position(pos.symbol)
-                        if result.get("status") == "success":
-                            logger.info(f"Closed {pos.symbol} via {reason}: PnL={result.get('pnl',0):+.2f}")
-                        else:
-                            logger.warning(f"Failed to close {pos.symbol} on {reason}: {result}")
-
-                except Exception as e:
-                    logger.debug(f"SL/TP check error for {pos.symbol}: {e}")
-
-        except Exception as e:
-            logger.warning(f"SL/TP monitor error: {e}")
-
-        stop_event.wait(5)  # Check mỗi 5 giây
-
-    logger.info("SL/TP monitor thread stopped")
+                    amt = client.get_position_amt(pos.symbol)
+                except Exception:
+                    continue
+                if abs(amt) < 1e-8:
+                    logger.info("Exchange reports %s closed; awaiting reconciliation", pos.symbol)
+                    continue
+                # In-process SL/TP check (fallback when exchange orders unavailable)
+                if pos.sl_price <= 0 and pos.tp_price <= 0:
+                    continue  # no local SL/TP targets
+                mark = client.get_symbol_price(pos.symbol)
+                if mark <= 0:
+                    continue
+                triggered = False
+                if pos.sl_price > 0:
+                    if (pos.side == "LONG" and mark <= pos.sl_price) or \
+                       (pos.side == "SHORT" and mark >= pos.sl_price):
+                        logger.warning("SL TRIGGERED: %s %s at %.4f (SL=%.4f)", pos.side, pos.symbol, mark, pos.sl_price)
+                        triggered = True
+                if not triggered and pos.tp_price > 0:
+                    if (pos.side == "LONG" and mark >= pos.tp_price) or \
+                       (pos.side == "SHORT" and mark <= pos.tp_price):
+                        logger.warning("TP TRIGGERED: %s %s at %.4f (TP=%.4f)", pos.side, pos.symbol, mark, pos.tp_price)
+                        triggered = True
+                if triggered:
+                    executor.close_position(pos.symbol)
+        except Exception as exc:
+            logger.warning("SL/TP monitor error: %s", exc)
+        stop_event.wait(5)
+    logger.info("SL/TP price monitor stopped")
 
 
 def start_sltp_monitor(client: BinanceFuturesClient, state_mgr: StateManager, executor: OrderExecutor) -> threading.Event:
@@ -203,8 +193,9 @@ def check_and_sync_positions(client: BinanceFuturesClient, state_mgr: StateManag
     for pos in list(state_mgr.get_positions()):
         try:
             amt = client.get_position_amt(pos.symbol)
-            # If position no longer exists on exchange (closed via SL/TP)
-            if abs(amt) < 0.0001:
+            # A non-zero exchange amount remains exposure regardless of symbol
+            # precision. get_position_amt is the authoritative signed value.
+            if abs(amt) == 0:
                 logger = logging.getLogger(__name__)
                 logger.info(f"Position {pos.symbol} closed on exchange (amt=0), removing from tracker")
                 
@@ -232,53 +223,80 @@ def check_and_sync_positions(client: BinanceFuturesClient, state_mgr: StateManag
             logger.warning(f"Failed to check position {pos.symbol}: {e}")
 
 
-def sync_exchange_positions(client: BinanceFuturesClient, state_mgr: StateManager):
-    """
-    Import ANY open position từ exchange vào StateManager.
-    (Xử lý trường hợp restart bot khi còn position trên sàn)
-    Tính SL/TP dựa trên ATR nếu chưa có.
+def reconcile_exchange_positions(client: BinanceFuturesClient, state_mgr: StateManager) -> dict:
+    """Classify every exchange position before new entries are allowed.
+
+    A position without a matching exchange-native stop is never silently
+    imported: the bot enters SAFE_HALT and requires operator remediation.
     """
     logger = logging.getLogger(__name__)
-    try:
-        account = client.get_account_info()
-        for p in account.get("positions", []):
-            amt = float(p.get("positionAmt", 0))
-            if abs(amt) < 0.0001:
-                continue
-            symbol = p.get("symbol", "")
-            if state_mgr.has_position(symbol):
-                continue
-            side = "LONG" if amt > 0 else "SHORT"
-            entry = float(p.get("entryPrice", 0))
-            
-            # Tính TP từ ATR (isolated margin → exchange tự liquidate SL)
-            sl_price = 0.0
-            tp_price = 0.0
-            try:
-                klines = client.get_klines(symbol, "15m", 100)
-                if klines and len(klines) >= 50:
-                    df = klines_to_df(klines)
-                    c_atr = float(atr(df, 14).iloc[-1])
-                    if c_atr > 0:
-                        if side == "LONG":
-                            tp_price = round(entry + c_atr * 2.5, max(6, len(str(c_atr).split('.')[1] if '.' in str(c_atr) else 2)))
-                        else:
-                            tp_price = round(entry - c_atr * 2.5, max(6, len(str(c_atr).split('.')[1] if '.' in str(c_atr) else 2)))
-                        logger.info(f"  Calculated TP={tp_price} (ATR={c_atr:.6f}, isolated, no SL needed)")
-            except Exception as e:
-                logger.debug(f"  Could not calculate TP: {e}")
-
-            logger.info(f"Synced position from exchange: {side} {symbol} {abs(amt):.0f} @ {entry}")
-            state_mgr.add_position(Position(
+    unprotected: list[str] = []
+    imported: list[str] = []
+    account = client.get_account_info()
+    if account.get("_error"):
+        reason = f"Cannot reconcile account: {account}"
+        state_mgr.safe_halt(reason)
+        logger.critical(reason)
+        return {"ready": False, "unprotected": ["ACCOUNT_READ_FAILED"], "imported": []}
+    for raw in account.get("positions", []):
+        amount = float(raw.get("positionAmt", 0))
+        if abs(amount) < 1e-8:
+            continue
+        if raw.get("positionSide") in {"LONG", "SHORT"}:
+            reason = f"Hedge-mode exposure is unsupported: {raw.get('symbol')} {raw.get('positionSide')}"
+            state_mgr.safe_halt(reason)
+            logger.critical(reason)
+            return {"ready": False, "unprotected": [raw.get("symbol", "UNKNOWN")], "imported": imported}
+        symbol = raw.get("symbol", "")
+        side = "LONG" if amount > 0 else "SHORT"
+        close_side = "SELL" if side == "LONG" else "BUY"
+        orders = client.get_open_orders(symbol)
+        if not isinstance(orders, list):
+            unprotected.append(symbol)
+            logger.critical("Cannot read orders for %s; treating exposure as unsafe", symbol)
+            state_mgr.record_unknown_exposure(Position(
+                symbol=symbol, side=side,
+                entry_price=float(raw.get("entryPrice", 0)),
+                quantity=abs(amount), sl_price=0.0, tp_price=0.0,
+            ), f"Cannot read orders for {symbol}; treated as unsafe")
+            continue
+        stop = next((order for order in orders if order.get("type") == "STOP_MARKET" and order.get("side") == close_side), None)
+        take_profit = next((order for order in orders if order.get("type") == "TAKE_PROFIT_MARKET" and order.get("side") == close_side), None)
+        if not stop:
+            unprotected.append(symbol)
+            # Still track the position so /position shows it; mark as UNKNOWN + SAFE_HALT
+            state_mgr.record_unknown_exposure(Position(
                 symbol=symbol,
                 side=side,
-                entry_price=entry,
-                quantity=abs(amt),
-                sl_price=sl_price,
-                tp_price=tp_price,
-            ))
-    except Exception as e:
-        logger.warning(f"Failed to sync exchange positions: {e}")
+                entry_price=float(raw.get("entryPrice", 0)),
+                quantity=abs(amount),
+                sl_price=0.0,
+                tp_price=0.0,
+                order_id_entry=None,
+            ), f"No STOP_MARKET found for unprotected {symbol}")
+            continue
+        if state_mgr.has_position(symbol):
+            continue
+        added = state_mgr.add_position(Position(
+            symbol=symbol,
+            side=side,
+            entry_price=float(raw.get("entryPrice", 0)),
+            quantity=abs(amount),
+            sl_price=float(stop.get("stopPrice", 0)),
+            tp_price=float(take_profit.get("stopPrice", 0)) if take_profit else 0.0,
+            order_id_sl=str(stop.get("orderId") or stop.get("clientAlgoId") or "") or None,
+            order_id_tp=str(take_profit.get("orderId") or take_profit.get("clientAlgoId") or "") if take_profit else None,
+        ))
+        if added:
+            imported.append(symbol)
+        else:
+            unprotected.append(symbol)
+    if unprotected:
+        state_mgr.safe_halt("Unprotected or untracked exchange exposure: " + ", ".join(unprotected))
+        logger.critical("Reconciliation failed; new entries disabled: %s", unprotected)
+        return {"ready": False, "unprotected": unprotected, "imported": imported}
+    logger.info("Exchange reconciliation complete; protected positions=%s", imported)
+    return {"ready": True, "unprotected": [], "imported": imported}
 
 
 # ---- Main Loop ----
@@ -286,13 +304,17 @@ def sync_exchange_positions(client: BinanceFuturesClient, state_mgr: StateManage
 
 def run_bot(testnet: bool = True, use_deepseek: bool = False):
     logger = logging.getLogger(__name__)
+    # Runtime settings are the source of truth; legacy constants remain only as CLI defaults.
+    runtime_settings = BotSettings.from_env()
+    bot_cfg.trading_enabled = runtime_settings.trading_enabled
+    bot_cfg.max_positions = runtime_settings.max_positions
     logger.info("=" * 60)
     logger.info(f"Binance Futures Trading Bot Starting...")
     logger.info(f"Mode: {'TESTNET' if testnet else 'LIVE'}")
-    logger.info(f"Scan interval: {SCAN_INTERVAL_SECONDS}s")
-    logger.info(f"Max positions: {MAX_POSITIONS}")
-    logger.info(f"Capital: {CAPITAL_USDT} USDT, Risk/trade: {RISK_PER_TRADE*100:.0f}%")
-    logger.info(f"Leverage: {LEVERAGE}x, SL: {SL_DISTANCE*100:.0f}%, TP: {TP_DISTANCE*100:.0f}%")
+    logger.info(f"Max positions: {runtime_settings.max_positions}")
+    logger.info(f"Capital allocation: {runtime_settings.capital_usdt} USDT, Risk/trade: {runtime_settings.risk_per_trade*100:.2f}%")
+    logger.info(f"Leverage: {runtime_settings.leverage}x, SL: ATR-based, TP: ATR-based")
+    logger.info(f"Scan interval: {runtime_settings.scan_interval_seconds}s")
     if use_deepseek:
         logger.info("DeepSeek AI filter: ENABLED")
     logger.info("=" * 60)
@@ -300,19 +322,20 @@ def run_bot(testnet: bool = True, use_deepseek: bool = False):
     # Telegram startup notification
     send_message(bot_start_msg(
         mode="TESTNET" if testnet else "LIVE",
-        capital=CAPITAL_USDT,
-        leverage=LEVERAGE,
+        capital=runtime_settings.capital_usdt,
+        leverage=runtime_settings.leverage,
     ))
 
-    # Initialize components
+    # Settings were resolved before startup logging.
     client = BinanceFuturesClient(testnet=testnet)
     state_mgr = StateManager(max_positions=bot_cfg.max_positions)
     executor = OrderExecutor(
         client=client,
         state_mgr=state_mgr,
-        capital_usdt=CAPITAL_USDT,
-        risk_per_trade=RISK_PER_TRADE,
-        leverage=LEVERAGE,
+        capital_usdt=runtime_settings.capital_usdt,
+        risk_per_trade=runtime_settings.risk_per_trade,
+        leverage=runtime_settings.leverage,
+        max_position_notional_pct=runtime_settings.max_position_notional_pct,
     )
     scanner = SignalScanner(
         client=client,
@@ -321,9 +344,43 @@ def run_bot(testnet: bool = True, use_deepseek: bool = False):
         interval_trend="1h",
         max_funding_rate_pct=bot_cfg.max_funding_rate_pct,
     )
+    scanner.min_rr = bot_cfg.min_rr
+    # Wrap scan_all to sync min_rr from config before each Telegram /scanlist call
+    def _scanlist():
+        scanner.min_rr = bot_cfg.min_rr
+        return scanner.scan_all()
+    set_scanlist_fetcher(_scanlist)
+    # Inject resume callback (force-clear SAFE_HALT from Telegram)
+    _resume_injected = False
+    def _resume():
+        nonlocal _resume_injected
+        if state_mgr.state == BotState.SAFE_HALT:
+            state_mgr.set_state(BotState.IDLE)
+            _resume_injected = True
+            logger.warning("Bot force-resumed from SAFE_HALT via Telegram")
+            return True
+        return False
+    set_resume_fetcher(_resume)
 
-    # Sync positions từ exchange (quan trọng khi restart bot)
-    sync_exchange_positions(client, state_mgr)
+     # Synchronize
+    try:
+        client.sync_time()
+    except Exception as exc:
+        state_mgr.safe_halt(f"Cannot synchronize Binance server time: {exc}")
+        raise RuntimeError("Startup aborted: Binance time synchronization failed") from exc
+
+    try:
+        client.assert_one_way_mode()
+    except Exception as exc:
+        state_mgr.safe_halt(f"Cannot verify One-way position mode: {exc}")
+        raise RuntimeError("Startup aborted: Binance account must use One-way Mode") from exc
+
+    # Reconcile first; never start entries while exchange exposure is unknown.
+    reconciliation = reconcile_exchange_positions(client, state_mgr)
+    if not reconciliation["ready"]:
+        send_tg("🚨 SAFE_HALT: unprotected exchange positions detected; entries disabled.")
+
+    # Legacy sync is intentionally not used: it inferred ATR targets and left stops unset.
 
     # Khởi động Telegram command listener (polling thread)
     tg_stop = start_polling()
@@ -335,7 +392,7 @@ def run_bot(testnet: bool = True, use_deepseek: bool = False):
         balance_fn=lambda: client.get_balance("USDT"),
         executor=executor,
     )
-    api_thread = start_api_thread(host="0.0.0.0", port=8765)
+    api_thread = start_api_thread(host=os.getenv("API_HOST", "127.0.0.1"), port=int(os.getenv("API_PORT", "8765")))
 
     # Inject callbacks cho Telegram commands (real-time data)
     tg_set_fetchers(
@@ -390,76 +447,68 @@ def run_bot(testnet: bool = True, use_deepseek: bool = False):
                 scanner.max_funding_rate_pct = bot_cfg.max_funding_rate_pct
                 logger.info(f"Funding rate filter updated to {bot_cfg.max_funding_rate_pct}% via Telegram")
 
+            # Cập nhật động R:R threshold
+            if scanner.min_rr != bot_cfg.min_rr:
+                scanner.min_rr = bot_cfg.min_rr
+                logger.info(f"R:R threshold updated to {bot_cfg.min_rr} via Telegram")
+
             # Kiểm tra restart_needed (khi đổi testnet/live)
             if bot_cfg.restart_needed:
                 logger.warning("Restart needed for mode change. Shutting down...")
                 send_tg("🔄 Cần restart để đổi mode. Đang tắt bot...")
                 break
 
-            # 3. Scan for signals if we have room
-            if state_mgr.can_open():
+            # 3. Scan for signals — keep opening while capacity and signals exist
+            while state_mgr.can_open():
 
-                # Kiểm tra trading_enabled từ Telegram command
                 if not bot_cfg.trading_enabled:
                     logger.info("Trading is DISABLED via Telegram. Skipping entry.")
-                    time.sleep(SCAN_INTERVAL_SECONDS)
-                    continue
+                    break
 
                 state_mgr.set_state(BotState.SCANNING)
 
-                # Check balance before scanning
                 balance = client.get_balance("USDT")
                 logger.info(f"USDT Balance: {balance:.2f}")
-                if balance < 50:
-                    logger.warning(f"Balance too low ({balance:.2f} USDT), skipping scan")
-                    time.sleep(SCAN_INTERVAL_SECONDS)
-                    continue
+                if balance <= 0:
+                    logger.warning("No available USDT balance; skipping scan")
+                    break
 
-                symbol, signal = scanner.scan()
+                symbol, signal = scanner.scan(eligible=lambda candidate, candidate_signal: executor.can_execute_signal(
+                    candidate, candidate_signal["side"], candidate_signal["entry_price"],
+                    candidate_signal["sl_price"], candidate_signal["tp1_price"],
+                ))
 
-                if symbol and signal:
-                    # Optional DeepSeek filter
-                    if deepseek_filter:
-                        logger.info(f"Checking signal with DeepSeek AI...")
-                        verdict = deepseek_filter(
-                            symbol, signal, signal["entry_price"], signal["rsi"]
-                        )
-                        logger.info(f"DeepSeek verdict: {verdict}")
-                        if verdict and verdict.lower().startswith("no"):
-                            logger.info(f"DeepSeek rejected signal for {symbol}, skipping")
-                            time.sleep(SCAN_INTERVAL_SECONDS)
-                            continue
+                if not symbol or not signal:
+                    logger.info("No more signals found this cycle")
+                    break
 
-                    # Execute trade with ATR-based SL/TP from scanner
-                    state_mgr.set_state(BotState.ENTERING)
-                    result = executor.open_position(
-                        symbol, signal["side"],
-                        sl_price=signal.get("sl_price"),
-                        tp1_price=signal.get("tp1_price"),
-                        tp2_price=signal.get("tp2_price"),
+                if deepseek_filter:
+                    logger.info(f"Checking signal with DeepSeek AI...")
+                    verdict = deepseek_filter(symbol, signal, signal["entry_price"], signal["rsi"])
+                    logger.info(f"DeepSeek verdict: {verdict}")
+                    if verdict and verdict.lower().startswith("no"):
+                        logger.info(f"DeepSeek rejected {symbol}, trying next signal...")
+                        continue
+
+                state_mgr.set_state(BotState.ENTERING)
+                result = executor.open_position(
+                    symbol, signal["side"],
+                    sl_price=signal.get("sl_price"),
+                    tp1_price=signal.get("tp1_price"),
+                    tp2_price=signal.get("tp2_price"),
+                )
+                logger.info(f"Trade result: {result}")
+
+                if result.get("status") == "success":
+                    logger.info(
+                        f">>> ENTERED {signal['side']} {symbol} @ {result['entry_price']:.2f} "
+                        f"| Qty={result['quantity']:.4f} "
+                        f"| SL={result['sl_price']:.2f} "
+                        f"TP1={result['tp1_price']:.2f} TP2={result['tp2_price']:.2f}"
                     )
-                    logger.info(f"Trade result: {result}")
-
-                    if result.get("status") == "success":
-                        logger.info(
-                            f">>> ENTERED {signal['side']} {symbol} @ {result['entry_price']:.2f} "
-                            f"| Qty={result['quantity']:.4f} "
-                            f"| SL={result['sl_price']:.2f} "
-                            f"TP1={result['tp1_price']:.2f} TP2={result['tp2_price']:.2f}"
-                        )
-                        # Telegram: tín hiệu + vào lệnh
-                        send_message(signal_msg(
-                            symbol, signal["side"], signal["entry_price"], signal["rsi"],
-                            signal.get("confidence"),
-                        ))
-                        send_message(entry_msg(
-                            symbol, signal["side"],
-                            result["entry_price"], result["quantity"],
-                            result["sl_price"], result["tp1_price"],
-                            balance, result.get("tp2_price"),
-                        ))
-                else:
-                    logger.info("No signal found this cycle")
+                    send_message(signal_msg(symbol, signal["side"], signal["entry_price"], signal["rsi"], signal.get("confidence")))
+                    send_message(entry_msg(symbol, signal["side"], result["entry_price"], result["quantity"],
+                        result["sl_price"], result["tp1_price"], balance, result.get("tp2_price")))
             else:
                 logger.info("Max positions reached — scanning paused")
 
@@ -468,12 +517,13 @@ def run_bot(testnet: bool = True, use_deepseek: bool = False):
             send_message(error_msg("Main loop error", str(e)))
 
         # Sleep between cycles (unless interrupted)
-        for _ in range(SCAN_INTERVAL_SECONDS):
+        for _ in range(runtime_settings.scan_interval_seconds):
             if killer.kill_now:
                 break
             time.sleep(1)
 
-    # Graceful shutdown
+    tg_stop.set()
+    sltp_stop.set()
     logger.info("Bot shutting down...")
     positions = state_mgr.get_positions()
     
@@ -567,10 +617,10 @@ def main():
     # Setup logging
     logger = setup_logging(verbose=args.verbose)
 
-    # Auto-detect mode: ưu tiên saved_mode từ .bot_state/mode.json
-    # (đã được set bởi Telegram /live hoặc /testnet),
-    # --live CLI flag ghi đè nếu được truyền.
-    testnet = not (args.live or saved_mode == "LIVE")
+    # Mode is resolved from the loaded environment. --live is an explicit CLI
+    # override; a saved Telegram mode only selects which env file is loaded.
+    runtime_settings = BotSettings.from_env()
+    testnet = False if args.live else runtime_settings.testnet
 
     if args.test:
         quick_test_run(testnet=testnet)

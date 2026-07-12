@@ -1,30 +1,35 @@
-"""
-State manager — tracks bot state and active positions.
-Max 2 concurrent positions enforced.
-"""
+"""Thread-safe bot state and explicit position lifecycle."""
 from __future__ import annotations
-from dataclasses import dataclass, field
+
+import logging
+import threading
+from dataclasses import dataclass
 from enum import Enum
 from typing import Optional
-import logging
 
 logger = logging.getLogger(__name__)
 
 
 class BotState(Enum):
-    """Overall bot operational state."""
+    SAFE_HALT = "safe_halt"
     IDLE = "idle"
     SCANNING = "scanning"
     ENTERING = "entering"
-    HOLDING = "holding"       # Max positions reached
+    HOLDING = "holding"
     EXITING = "exiting"
+
+
+class PositionStatus(Enum):
+    OPENING = "opening"
+    OPEN = "open"
+    CLOSING = "closing"
+    UNKNOWN = "unknown"
 
 
 @dataclass
 class Position:
-    """Represents an active trading position."""
     symbol: str
-    side: str               # "LONG" or "SHORT"
+    side: str
     entry_price: float
     quantity: float
     sl_price: float
@@ -34,100 +39,95 @@ class Position:
     order_id_tp: Optional[str] = None
     pnl: float = 0.0
     roi_pct: float = 0.0
+    status: PositionStatus = PositionStatus.OPEN
 
 
 class StateManager:
-    """
-    Manages bot state and tracks up to N concurrent positions.
-    Thread-safe for single-threaded async usage.
-    """
+    """Owns in-memory position state; all check-and-mutate operations are locked."""
 
-    def __init__(self, max_positions: int = 2):
+    def __init__(self, max_positions: int = 1):
         self.max_positions = max_positions
         self._state = BotState.IDLE
         self._positions: list[Position] = []
-        logger.info(f"StateManager initialized (max_positions={max_positions})")
-
-    # ---- State ----
+        self._lock = threading.RLock()
 
     @property
     def state(self) -> BotState:
-        return self._state
+        with self._lock:
+            return self._state
 
-    def set_state(self, state: BotState):
-        old = self._state
-        self._state = state
-        logger.debug(f"State: {old.value} → {state.value}")
-
-    # ---- Position queries ----
+    def set_state(self, state: BotState) -> None:
+        with self._lock:
+            self._state = state
 
     def can_open(self) -> bool:
-        """Check if we can open a new position."""
-        return len(self._positions) < self.max_positions
+        with self._lock:
+            return self._state != BotState.SAFE_HALT and len(self._positions) < self.max_positions
 
     def has_position(self, symbol: str) -> bool:
-        return any(p.symbol == symbol for p in self._positions)
+        with self._lock:
+            return any(p.symbol == symbol for p in self._positions)
 
     def get_position(self, symbol: str) -> Optional[Position]:
-        for p in self._positions:
-            if p.symbol == symbol:
-                return p
-        return None
+        with self._lock:
+            return next((p for p in self._positions if p.symbol == symbol), None)
 
     def get_positions(self) -> list[Position]:
-        return list(self._positions)
-
-    def position_count(self) -> int:
-        return len(self._positions)
-
-    # ---- Position management ----
+        with self._lock:
+            return list(self._positions)
 
     def add_position(self, position: Position) -> bool:
-        """Add a position. Returns False if at max capacity."""
-        if not self.can_open():
-            logger.warning(f"Cannot add {position.symbol}: max {self.max_positions} positions reached")
-            return False
+        with self._lock:
+            if not self.can_open() or self.has_position(position.symbol):
+                return False
+            self._positions.append(position)
+            self._state = BotState.HOLDING if len(self._positions) >= self.max_positions else BotState.IDLE
+            return True
 
-        if self.has_position(position.symbol):
-            logger.warning(f"Cannot add {position.symbol}: already tracked")
-            return False
+    def begin_close(self, symbol: str) -> Optional[Position]:
+        with self._lock:
+            position = self.get_position(symbol)
+            if not position or position.status == PositionStatus.CLOSING:
+                return None
+            position.status = PositionStatus.CLOSING
+            self._state = BotState.EXITING
+            return position
 
-        self._positions.append(position)
-        logger.info(f"Position added: {position.side} {position.symbol} @ {position.entry_price}")
-        logger.info(f"  Qty={position.quantity:.4f} | SL={position.sl_price:.2f} | TP={position.tp_price:.2f}")
-
-        if not self.can_open():
-            self.set_state(BotState.HOLDING)
-
-        return True
+    def cancel_close(self, symbol: str) -> None:
+        with self._lock:
+            position = self.get_position(symbol)
+            if position:
+                position.status = PositionStatus.OPEN
+                self._state = BotState.HOLDING if len(self._positions) >= self.max_positions else BotState.IDLE
 
     def remove_position(self, symbol: str) -> bool:
-        """Remove a position by symbol."""
-        for i, p in enumerate(self._positions):
-            if p.symbol == symbol:
-                removed = self._positions.pop(i)
-                logger.info(f"Position removed: {removed.side} {removed.symbol} (PnL={removed.pnl:.2f})")
-                self.set_state(BotState.SCANNING if self.can_open() else BotState.HOLDING)
-                return True
-        logger.warning(f"Position {symbol} not found, cannot remove")
-        return False
+        with self._lock:
+            for index, position in enumerate(self._positions):
+                if position.symbol == symbol:
+                    self._positions.pop(index)
+                    self._state = BotState.IDLE if self.can_open() else BotState.HOLDING
+                    return True
+            return False
 
-    def update_position_pnl(self, symbol: str, pnl: float, roi_pct: float):
-        """Update the running PnL for a position (called periodically)."""
-        p = self.get_position(symbol)
-        if p:
-            p.pnl = pnl
-            p.roi_pct = roi_pct
+    def update_position_pnl(self, symbol: str, pnl: float, roi_pct: float) -> None:
+        with self._lock:
+            position = self.get_position(symbol)
+            if position:
+                position.pnl, position.roi_pct = pnl, roi_pct
 
-    def clear_positions(self):
-        """Remove all tracked positions (e.g. on bot restart)."""
-        count = len(self._positions)
-        self._positions.clear()
-        self.set_state(BotState.IDLE)
-        logger.info(f"Cleared {count} positions")
+    def record_unknown_exposure(self, position: Position, reason: str) -> None:
+        """Retain a local record when the exchange cannot prove an exit occurred."""
+        with self._lock:
+            existing = self.get_position(position.symbol)
+            if existing:
+                existing.status = PositionStatus.UNKNOWN
+            else:
+                position.status = PositionStatus.UNKNOWN
+                self._positions.append(position)
+            self._state = BotState.SAFE_HALT
+            logger.critical("Unknown exchange exposure retained for %s: %s", position.symbol, reason)
 
-    def __repr__(self) -> str:
-        return (
-            f"StateManager(state={self._state.value}, "
-            f"positions={len(self._positions)}/{self.max_positions})"
-        )
+    def safe_halt(self, reason: str) -> None:
+        with self._lock:
+            self._state = BotState.SAFE_HALT
+            logger.critical("Bot entered SAFE_HALT: %s", reason)

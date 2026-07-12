@@ -1,21 +1,18 @@
-version: '3.8'
-
 services:
   bot:
     build: .
     container_name: binance-futures-bot
     restart: unless-stopped
+    # Expose REST API for host access
     ports:
       - "8765:8765"
     volumes:
-      # Mount .env và .env.live từ host (không build vào image)
       - ./.env:/app/.env:ro
       - ./.env.live:/app/.env.live:ro
-      # Persist state file (mode TESTNET/LIVE)
       - ./.bot_state:/app/.bot_state
-      # Logs
       - ./logs:/app/logs
     environment:
-      - TZ=Asia/Ho_Chi_Minh
-    # Khởi động với mode mặc định từ .bot_state
+      TZ: Asia/Ho_Chi_Minh
+      API_HOST: 0.0.0.0
+      ENABLE_API_MUTATIONS: 'false'
     command: ["python", "main.py", "--verbose"]

@@ -1,20 +1,28 @@
 # Binance Futures API Credentials
-# Get testnet keys: https://testnet.binancefuture.com/
-# Get live keys: https://www.binance.com/en/support/faq/how-to-create-api-keys-on-binance-360002502072
-
+# Start on testnet. Use an API key with Futures permission only and withdrawals disabled.
 BINANCE_API_KEY=your_api_key_here
 BINANCE_API_SECRET=your_api_secret_here
-
-# Set to "true" for testnet, "false" for live trading
 BINANCE_TESTNET=true
 
-# DeepSeek API (optional — remove if not using AI filter)
-DEEPSEEK_API_KEY=your_deepseek_api_key
-DEEPSEEK_BASE_URL=https://api.deepseek.com/v1
+# FAIL-SAFE DEFAULTS: the bot scans but cannot place orders unless explicitly enabled.
+TRADING_ENABLED=false
+TRADE_LEVERAGE=10
+MAX_POSITIONS=1
+RISK_PER_TRADE=0.015
+MAX_POSITION_NOTIONAL_PCT=0.10
+TOP_N_SYMBOLS=30
+SCAN_INTERVAL_SECONDS=120
 
-# Bot configuration (optional overrides)
-# TRADE_CAPITAL=100
-# TRADE_LEVERAGE=3
-# MAX_POSITIONS=2
-# TOP_N_SYMBOLS=10
-# SCAN_INTERVAL=15m
+# REST control plane is local-only and mutation endpoints require both variables.
+API_HOST=127.0.0.1
+API_PORT=8765
+API_CONTROL_TOKEN=replace_with_a_long_random_secret
+ENABLE_API_MUTATIONS=false
+
+# Optional DeepSeek filter
+# DEEPSEEK_API_KEY=your_deepseek_api_key
+# DEEPSEEK_BASE_URL=https://api.deepseek.com/v1
+
+# Optional Telegram notifications
+# TELEGRAM_BOT_TOKEN=your_bot_token
+# TELEGRAM_CHAT_ID=your_chat_id
